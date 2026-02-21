@@ -1,0 +1,5 @@
+PAR_TAG = {}
+CURRENT_TAG = ''
+PAR_TAG_CLOSED = {}
+CURRENT_TAG = ''
+CURRENT_VIEW = 'open'
