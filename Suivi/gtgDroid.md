@@ -2,7 +2,7 @@
 
 ## Vision
 
-Application Android de gestion de tâches GTD, clone mobile de GTG (Getting Things GNOME), synchronisée via CalDAV avec Nextcloud. Objectif final : publier sur F-Droid.
+Application Android de gestion de tâches GTD, clone mobile de GTG (Getting Things GNOME), synchronisée via CalDAV avec Nextcloud. Objectif final : publier sur F-Droid avec une qualité et une expérience utilisateur équivalente aux meilleures apps propriétaires.
 
 ---
 
@@ -25,7 +25,7 @@ gtgDroid/
 │   └── new_task.py          # Formulaire création/modification/sous-tâche
 ├── NotoColorEmoji.ttf
 ├── NotoEmoji.ttf
-├── .gitignore               # Exclut config.py, .venv/, __pycache__/, *.log
+├── .gitignore
 ├── Suivi/
 │   ├── gtgDroid.md          # Ce fichier
 │   └── GTGDroid_vision.md
@@ -40,221 +40,125 @@ source .venv/bin/activate
 python3 main.py
 ```
 
-### Premier démarrage (contributeur)
-
-```bash
-cp config-sample.py config.py
-# Éditer config.py avec ses credentials Nextcloud
-```
-
 ---
 
 ## Modèle de données
 
-### Tuple tâche (8 éléments)
+### Tuple tâche (8 éléments) — à migrer vers dataclass
 
 ```python
 (title, status, due_str, start_str, description, task_uid, priority, has_children)
 #  [0]    [1]     [2]      [3]         [4]          [5]       [6]       [7]
 ```
 
-| Index | Champ | Type | Exemple |
-|-------|-------|------|---------|
-| 0 | title | str | `"Préparer le marché"` |
-| 1 | status | str | `"NEEDS-ACTION"`, `"COMPLETED"` |
-| 2 | due_str | str | `"31/12/2025"` ou `""` |
-| 3 | start_str | str | `"01/12/2025"` ou `""` |
-| 4 | description | str | Notes libres |
-| 5 | task_uid | str | UUID CalDAV |
-| 6 | priority | int | `0`, `5`, `9` |
-| 7 | has_children | bool | `True` si la tâche a des sous-tâches |
-
-> ⚠️ Tout code qui dépacke le tuple doit inclure `has_children` en 8e position.
+> ⚠️ Le tuple est fragile — ajouter un champ impose de modifier tous les endroits qui le dépackent. Migration vers `dataclass` planifiée en Phase 2 (voir roadmap).
 
 ### Variables globales et cache (`state.py`)
 
 ```python
-PAR_TAG = {}          # dict {tag: [tuple_tâche, ...]} — tâches ouvertes
-PAR_TAG_CLOSED = {}   # dict {tag: [tuple_tâche, ...]} — tâches fermées
-CURRENT_TAG = ''      # tag sélectionné en cours
-CURRENT_VIEW = 'open' # vue active : 'open', 'actionable', 'closed'
+PAR_TAG = {}           # tâches ouvertes (NEEDS-ACTION) groupées par tag
+PAR_TAG_CLOSED = {}    # tâches faites (COMPLETED) groupées par tag
+PAR_TAG_DISMISSED = {} # tâches abandonnées (CANCELLED) groupées par tag
+CURRENT_TAG = ''
+CURRENT_VIEW = 'open'  # 'open', 'actionable', 'closed', 'dismissed'
 
-# Cache local — chargé une seule fois au démarrage via fetch_all()
-TAGS_PAR_UID = {}     # {task_uid: "IT, urgent"} — tous les tags d'une tâche
-SUBTASKS_PAR_UID = {} # {task_uid: [tuple_tâche, ...]} — sous-tâches triées A→Z
+# Cache local — zéro appel réseau dans les écrans
+TAGS_PAR_UID = {}      # {uid: "IT, urgent"}
+SUBTASKS_PAR_UID = {}  # {uid: [tuple, ...]}
 ```
 
 ---
 
-## Architecture réseau — principe fondamental
+## Architecture réseau
 
-### Un seul fetch au démarrage
-
-`fetch_all()` fait **un seul passage** sur Nextcloud et remplit simultanément les 4 structures de `state.py`. Après ce fetch initial, **zéro appel réseau** n'est nécessaire pour naviguer, afficher des tags, ou afficher des sous-tâches.
-
-```
-Démarrage → fetch_all() → state.PAR_TAG
-                        → state.PAR_TAG_CLOSED
-                        → state.TAGS_PAR_UID
-                        → state.SUBTASKS_PAR_UID
-```
-
-Les appels réseau ne se font qu'à l'**écriture** : `create_task`, `update_task`, `delete_task`, `mark_as_done`, `reset_and_clone_task`. Après chaque écriture, `fetch_all()` est rappelé pour resynchroniser le cache.
+`fetch_all()` fait **un seul passage** sur Nextcloud au démarrage et remplit tout `state`. Zéro appel réseau dans les écrans — uniquement à l'écriture, suivi d'un `fetch_all()` pour resynchroniser.
 
 ### Performances validées (140 tâches, Nextcloud distant)
-- Chargement initial : ~8 secondes (fetch_all unique)
-- Navigation entre écrans : instantanée (lecture cache)
-- Transitions fluides : zéro blocage réseau pendant les animations
+- Chargement initial : ~8 secondes
+- Navigation : instantanée
+- Transitions : fluides
 
 ---
 
-## Fonctions `caldav_api.py`
+## Statuts des tâches
 
-| Fonction | Réseau | Description |
-|----------|--------|-------------|
-| `get_client()` | oui | Nouvelle instance DAVClient |
-| `_clean_tags(tags)` | non | Retire `@`, filtre `DAV_gtg` |
-| `_parse_tags(tag_str)` | non | `"IT, @urgent"` → `['IT', 'urgent']` |
-| `fetch_all()` | oui | **Fetch principal** — remplit tout state |
-| `fetch_tasks()` | oui | Appelle `fetch_all()`, retourne `PAR_TAG` |
-| `fetch_tasks_completed()` | non | Retourne `PAR_TAG_CLOSED` depuis cache |
-| `fetch_subtasks(parent_uid)` | non | Retourne depuis `SUBTASKS_PAR_UID` |
-| `fetch_tags_for_uid(uid)` | non | Retourne depuis `TAGS_PAR_UID` |
-| `create_task(title, tags, ...)` | oui | Multi-tags supporté |
-| `create_subtask(parent_uid, ...)` | oui | Crée avec RELATED-TO |
-| `update_task(uid, title, tags, ...)` | oui | Multi-tags, dates en vDatetime UTC |
-| `delete_task(uid)` | oui | Suppression définitive |
-| `mark_as_done(uid)` | oui | `todo.complete()` |
-| `reset_and_clone_task(uid)` | oui | Archive + recrée avec sous-tâches |
-
----
-
-## Navigation entre écrans
-
-```
-LoadingScreen → TagsScreen → TasksScreen → DetailScreen → NewTaskScreen
-                                               ↕ (sous-tâches, retour au parent)
-```
-
-- Direction `left` : avancer
-- Direction `right` : reculer
-- Navigation sous-tâche : `load_task(sub_data, from_parent_data=task_data)` — retour automatique au parent, profondeur illimitée
-- Après édition : `detail` rechargé avec les données fraîches du cache
-
----
-
-## Sous-tâches
-
-### Stockage CalDAV
-Champ standard `RELATED-TO` :
-```
-RELATED-TO;RELTYPE=PARENT:[uid_parent]
-```
-Compatible GTG desktop, tasks.org, Nextcloud.
-
-### Tri
-Alphabétique. Convention recommandée : `01-`, `02-` ou `A-`, `B-` pour contrôler l'ordre.
-
-### Affichage dans le détail
-- Cases `○` / `✓` cochables directement
-- Bouton `>` pour naviguer dans le détail de chaque enfant
-- Bouton `+ Ajouter une sous-tâche` toujours visible
-- Retour depuis l'enfant → revient sur le parent
-
-### Indicateurs visuels
-- Liste des tâches : icône `▶` et fond bleuté
-- Détail : titre préfixé `▶` en bleu
-- Liste des tags : indicateur `▶` sur le tag
-
----
-
-## Affichage des tags
-
-### Dans la liste des tâches (`tasks.py`)
-- Tag courant : affiché dans le header `#IT`
-- Autres tags : affichés en petit sous le titre de chaque tâche
-- Source : `state.TAGS_PAR_UID` — instantané, zéro réseau
-
-### Dans le détail (`detail.py`)
-- Tags affichés en jaune doré sous le titre : `@IT  @urgent`
-- Source : `state.TAGS_PAR_UID` — instantané, zéro réseau
-
-### Convention GTG
-- GTG stocke les tags avec `@` en CalDAV
-- `_clean_tags()` retire le `@` à la lecture
-- `_parse_tags()` retire le `@` à l'écriture
-- `@DAV_gtg` : tag technique GTG, filtré partout, jamais affiché
-- Saisie multi-tags : `IT, urgent, perso` (virgule comme séparateur)
-
----
-
-## Réinitialiser une tâche récurrente
-
-> **Vocabulaire** : "récurrent" ≠ "cyclique". Les marchés et renouvellements médicaments sont récurrents mais non cycliques — RRULE n'est pas adapté.
-
-### Bouton `↺ Réinitialiser → "Un jour"`
-1. Archive la tâche et ses sous-tâches (COMPLETED)
-2. Recrée une copie fraîche : même titre, mêmes sous-tâches, PRIORITY=9, sans dates
-
-### Différence avec "Marquer comme faite"
-| Action | Effet | Sous-tâches |
-|--------|-------|-------------|
-| ✓ Marquer comme faite | Archive uniquement | Non touchées |
-| ↺ Réinitialiser | Archive + recrée | Archivées ET recréées |
+| Statut CalDAV | Bouton gtgDroid | Vue | Compte dans stats |
+|---------------|-----------------|-----|-------------------|
+| NEEDS-ACTION | — | Ouvertes / Actionnables | — |
+| COMPLETED | ✓ Marquer comme faite | Fermées | ✅ Oui |
+| CANCELLED | ✕ Abandonner | Abandonnées | ❌ Non |
 
 ---
 
 ## Gestion des dates fuzzy
 
-### Solution : champ PRIORITY CalDAV
-| Bouton gtgDroid | PRIORITY | GTG desktop |
-|-----------------|----------|-------------|
+### Problème
+GTG stocke `soon`/`someday` en XML local, non synchronisé CalDAV. La synchro GTG → Nextcloud perd cette information.
+
+### Solution actuelle : PRIORITY CalDAV
+| Bouton | PRIORITY | GTG desktop |
+|--------|----------|-------------|
 | Maintenant | 0 | Pas de date |
 | Bientôt | 5 | Ignoré |
 | Un jour | 9 | Ignoré |
 
-### Format des dates dans update_task
-Nextcloud (SabreDAV) est strict — il n'accepte que `vDatetime` avec timezone UTC :
+### Piste retenue pour la suite : champ X-GTG-FUZZY (Option C)
+Stocker en parallèle un champ CalDAV personnalisé :
+```
+X-GTG-FUZZY:soon
+X-GTG-FUZZY:someday
+```
+**Avantages :**
+- GTG l'ignore silencieusement (standard CalDAV — les champs `X-` inconnus sont préservés)
+- Pas d'effet de bord sur les autres clients (tasks.org, etc.)
+- Base propre pour un futur patch GTG qui lirait ce champ
+- On garde PRIORITY en parallèle pour tasks.org
+
+**Ce que ça change dans le code :**
+- `create_task()` et `update_task()` : écrire `X-GTG-FUZZY` selon le bouton choisi
+- `fetch_all()` : lire `X-GTG-FUZZY` et le stocker dans le tuple/dataclass
+- Affichage : montrer "Bientôt" / "Un jour" depuis ce champ plutôt que PRIORITY
+
+---
+
+## Points techniques à anticiper
+
+### A — Historique grandissant
+`fetch_all()` charge toutes les tâches y compris COMPLETED et CANCELLED. Dans 2 ans avec 2000+ tâches archivées, le chargement va exploser.
+**Solution future :** charger l'historique à la demande (bouton "Charger plus"), ou limiter à une fenêtre temporelle (ex : 90 jours).
+
+### B — Conflits de synchro
+Si une tâche est modifiée simultanément sur GTG desktop et gtgDroid, le dernier à écrire gagne silencieusement. Comportement identique à GTG lui-même — acceptable, mais à documenter dans le README.
+
+### C — Tuple fragile → dataclass
+Chaque nouveau champ impose de modifier tous les endroits qui dépackent le tuple. Avec `dataclass` :
 ```python
-from icalendar import vDatetime
-from datetime import timezone
-dt = datetime.strptime(date_str, '%d/%m/%Y').replace(tzinfo=timezone.utc)
-vtodo['DTSTART'] = vDatetime(dt)  # → 20260222T000000Z ✓
+@dataclass
+class Task:
+    title: str
+    status: str
+    due_str: str
+    start_str: str
+    description: str
+    task_uid: str
+    priority: int
+    has_children: bool
+    fuzzy: str = ''  # 'soon', 'someday', ''
 ```
-Formats rejetés par SabreDAV : `date` Python brut, `datetime` sans timezone, `vDate`.
+Ajouter un champ devient anodin — les anciens accès ne cassent pas.
+
+### D — dismiss_task() et include_completed
+`dismiss_task()` cherche dans `todos(include_completed=False)`. Le comportement de la lib caldav sur les tâches `CANCELLED` avec ce filtre est à vérifier — impact sur la future fonction "Ré-ouvrir une tâche".
+
+### E — Pas de "Ré-ouvrir une tâche"
+Actuellement impossible de rouvrir une tâche fermée ou abandonnée. Fonctionnalité GTG importante pour la mémoire — à implémenter dans la vue Fermées et Abandonnées.
 
 ---
 
-## Gestion du dépôt Git
+## Roadmap détaillée
 
-### `.gitignore`
-```
-.venv/
-__pycache__/
-*.pyc
-*.pyo
-config.py
-*.log
-.kivy/
-```
+### Phase 1 — Fonctionnalités core ✅ COMPLÈTE
 
-> ⚠️ `config.py` contient les credentials Nextcloud — ne jamais committer.
-
-### `config-sample.py`
-Modèle versionné pour les contributeurs. Contient URL, USERNAME, PASSWORD en exemple avec commentaires.
-
-### Historique des commits
-| Commit | Description |
-|--------|-------------|
-| initial | Structure de base, connexion CalDAV |
-| ... | Vues ouvertes/actionnables/fermées, dates fuzzy |
-| 71c4100 | Cache local, multi-tags, sous-tâches, tags affichés, fix dates CalDAV |
-
----
-
-## Roadmap
-
-### Phase 1 — Fonctionnalités core
 - [x] Connexion CalDAV Nextcloud
 - [x] Lecture tâches par tags (CATEGORIES)
 - [x] Créer, modifier, supprimer une tâche
@@ -263,44 +167,104 @@ Modèle versionné pour les contributeurs. Contient URL, USERNAME, PASSWORD en e
 - [x] Écran de chargement
 - [x] DTSTART et DUE en lecture et édition
 - [x] Dates fuzzy Bientôt/Un jour via PRIORITY CalDAV
-- [x] Vue Ouvertes / Actionnables / Fermées
+- [x] Vue Ouvertes / Actionnables / Fermées / Abandonnées
 - [x] Sous-tâches (RELATED-TO) — lecture, création, cochage
-- [x] Navigation parent ↔ enfant avec retour correct
+- [x] Navigation parent ↔ enfant avec retour correct à n'importe quelle profondeur
 - [x] Indice visuel ▶ sur les tâches parentes
 - [x] Réinitialiser une tâche récurrente (archive + clone)
 - [x] Multi-tags — saisie `tag1, tag2`, nettoyage `@`
-- [x] Bouton + dans la liste des tâches d'un tag
-- [x] Tags affichés dans le détail (jaune doré, depuis cache)
-- [x] Tags affichés dans la liste des tâches (autres tags sous le titre)
+- [x] Bouton + dans la liste des tâches et des tags
+- [x] Tags affichés dans le détail (jaune doré) et dans la liste des tâches
 - [x] Cache local complet — transitions fluides, zéro appel réseau dans les écrans
 - [x] Fix dates CalDAV — vDatetime UTC pour SabreDAV/Nextcloud
-- [x] Rechargement immédiat après édition (données fraîches dans detail)
+- [x] Rechargement immédiat après édition
+- [x] Statut Abandonné (CANCELLED) distinct de Terminé (COMPLETED)
 - [x] .gitignore + config-sample.py
-- [ ] Statuts complets (Actif, Différé, À faire, Inactif)
 
-### Phase 2 — Fonctionnalités avancées
-- [ ] Optimisation chargement initial (connexion persistante, fetch partiel)
-- [ ] Compteur X/X tâches réalisées par tag
-- [ ] Poids en temps (durée estimée)
-- [ ] Rappels
-- [ ] Tags hiérarchiques
+---
 
-### Phase 3 — Design
-- [ ] Interface proche de GTG desktop
+### Phase 2 — Robustesse et fonctionnalités avancées
+
+#### 2.1 — Refactoring dataclass (priorité haute)
+**Pourquoi maintenant :** avant d'ajouter des champs (fuzzy, durée...), migrer le tuple vers dataclass évite une dette technique explosive.
+- [ ] Créer `models.py` avec `@dataclass Task`
+- [ ] Migrer `fetch_all()` pour retourner des `Task`
+- [ ] Mettre à jour tous les écrans (accès par attribut au lieu d'index)
+- [ ] Tests de non-régression
+
+#### 2.2 — Dates fuzzy propres (X-GTG-FUZZY)
+- [ ] Écrire `X-GTG-FUZZY:soon/someday` dans `create_task()` et `update_task()`
+- [ ] Lire `X-GTG-FUZZY` dans `fetch_all()` → stocker dans `Task.fuzzy`
+- [ ] Afficher "Bientôt" / "Un jour" depuis `Task.fuzzy` dans le détail et la liste
+- [ ] Garder PRIORITY en parallèle pour tasks.org
+
+#### 2.3 — Ré-ouvrir une tâche
+- [ ] Bouton "Ré-ouvrir" dans le détail des tâches Fermées et Abandonnées
+- [ ] `reopen_task(uid)` dans `caldav_api.py` → `STATUS:NEEDS-ACTION`
+- [ ] Vérifier comportement de `todos(include_completed=False)` avec CANCELLED
+
+#### 2.4 — Gamification et stats
+- [ ] Compteur "X tâches faites aujourd'hui" dans le header de TagsScreen
+- [ ] Objectif journalier configurable (5 tâches par défaut)
+- [ ] Compteur X/X par tag (tâches faites / total)
+- [ ] Les tâches CANCELLED ne comptent PAS dans les stats
+
+#### 2.5 — Optimisation chargement historique
+- [ ] Séparer le fetch initial (ouvertes) du fetch historique (fermées + abandonnées)
+- [ ] Charger l'historique à la demande depuis les vues Fermées/Abandonnées
+- [ ] Objectif : chargement initial < 3 secondes
+
+#### 2.6 — Poids en temps
+- [ ] Champ "Durée estimée" dans le formulaire (DURATION CalDAV)
+- [ ] Affichage dans le détail
+- [ ] Total de temps par tag (pour alimenter l'agenda)
+
+---
+
+### Phase 3 — Design et UX
+
+#### 3.1 — Lisibilité et hiérarchie visuelle
+- [ ] Indicateur visuel Maintenant / Bientôt / Un jour dans la liste des tâches (couleur ou icône)
 - [ ] Afficher "Bientôt" au lieu de la date quand échéance < 15 jours
-- [ ] Indicateur visuel Maintenant/Bientôt/Un jour dans la liste
-- [ ] Icônes, couleurs, polices
-- [ ] Surbrillance jaune fluo sur les tags (comme GTG desktop)
+- [ ] Tags en surbrillance style GTG (fond coloré) dans le détail
+- [ ] Meilleure distinction visuelle entre tâches parentes et enfants
+
+#### 3.2 — Interface proche de GTG desktop
+- [ ] Couleurs cohérentes avec GTG (palette GTG)
+- [ ] Support des emojis sur les tags (ex : 🏠 Home, 💻 IT)
+- [ ] Polices et tailles harmonisées
+- [ ] Icônes métier (pas les boutons Kivy par défaut)
+
+#### 3.3 — Confort mobile
+- [ ] Swipe gauche sur une tâche → Abandonner
+- [ ] Swipe droit sur une tâche → Marquer comme faite
+- [ ] Scroll infini (lazy loading) pour les longues listes
+- [ ] Mode paysage supporté
+
+#### 3.4 — Rappels
+- [ ] Champ rappel dans le formulaire (VALARM CalDAV)
+- [ ] Notification Android au moment du rappel
+
+---
 
 ### Phase 4 — Android
-- [ ] Packaging APK avec Buildozer
-- [ ] Tests sur Fairphone
-- [ ] Publication F-Droid
 
-### Phase 5 — Contribution open source
-- [ ] "Verrue" Debian pour synchronisation des dates fuzzy
-- [ ] Patch GTG pour bidirectionnalité des dates fuzzy via CalDAV
-- [ ] Soumettre Pull Request au projet getting-things-gnome/gtg
+- [ ] Packaging APK avec Buildozer
+- [ ] `buildozer.spec` configuré (permissions réseau, notifications)
+- [ ] Tests sur Fairphone (résolution, tactile, performances)
+- [ ] Icône de l'application
+- [ ] Écran de démarrage (splash screen)
+- [ ] Publication sur F-Droid
+- [ ] README complet pour les contributeurs
+
+---
+
+### Phase 5 — Contribution open source GTG
+
+- [ ] **Vue "Abandonnées" dans GTG desktop** — GTG gère `STATUS:CANCELLED` en écriture mais n'a pas de vue dédiée. Contribuer une vue "Dismissed" qui lit les tâches `CANCELLED` depuis CalDAV. Important pour la mémoire et la gamification (ne pas mélanger avec les tâches faites).
+- [ ] **Patch dates fuzzy** — GTG lire `X-GTG-FUZZY:soon/someday` depuis CalDAV et écrire `<due>soon</due>` dans son XML local. Bidirectionnalité complète.
+- [ ] **"Verrue" Debian** — alternative au patch GTG : script externe qui surveille CalDAV et réécrit le XML GTG local.
+- [ ] Soumettre Pull Requests au projet getting-things-gnome/gtg
 
 ---
 
@@ -310,17 +274,16 @@ Modèle versionné pour les contributeurs. Contient URL, USERNAME, PASSWORD en e
 |----------|----------|
 | `uid` réservé par Kivy | Utiliser `task_uid` |
 | `background_color` non supporté sur Label | Utiliser `canvas.before` |
-| Warning `Ical data was modified` | Inoffensif — Nextcloud ajoute DTSTAMP manquant |
+| Warning `Ical data was modified` | Inoffensif — Nextcloud ajoute DTSTAMP |
 | `date` réservé Python | Utiliser `date_str` |
-| N appels réseau pour `has_children` | Remplacé par `_build_parents_set()` dans `fetch_all()` |
-| State résiduel dans NewTaskScreen | `edit_uid` et `parent_uid` remis à `None` en premier dans `load_form()` |
-| Tags GTG avec `@` | `_clean_tags()` à la lecture, `_parse_tags()` à l'écriture |
+| N appels réseau pour `has_children` | `_build_parents_set()` dans `fetch_all()` |
+| State résiduel dans NewTaskScreen | `edit_uid` et `parent_uid` remis à `None` en premier |
+| Tags GTG avec `@` | `_clean_tags()` lecture, `_parse_tags()` écriture |
 | `@DAV_gtg` tag technique | Filtré dans `_TAGS_IGNORES` |
-| Multi-tags en édition | `fetch_tags_for_uid()` lit depuis `TAGS_PAR_UID` — zéro réseau |
-| Transitions bloquées par appels réseau | Cache complet dans state — écrans ne font plus d'appels |
-| SabreDAV rejette `date` Python brut | `vDatetime` avec `timezone.utc` obligatoire dans `update_task` |
-| Détail pas mis à jour après édition | `new_task.py` retrouve la tâche dans le cache frais et recharge `detail` |
-| Indentation Python | 4 espaces par niveau, jamais de tabulations |
+| Transitions bloquées | Cache complet dans state |
+| SabreDAV rejette `date` Python | `vDatetime` avec `timezone.utc` dans `update_task` |
+| Détail pas mis à jour après édition | Retrouver la tâche dans le cache frais |
+| `dismiss_task()` et CANCELLED | À vérifier avec `include_completed=False` |
 
 ---
 
@@ -343,3 +306,16 @@ Modèle versionné pour les contributeurs. Contient URL, USERNAME, PASSWORD en e
 ```
 https://github.com/pentux-GitHub/gtgDroid
 ```
+
+### `.gitignore`
+```
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+config.py
+*.log
+.kivy/
+```
+
+> ⚠️ `config.py` contient les credentials Nextcloud — ne jamais committer.

@@ -271,6 +271,22 @@ class DetailScreen(Screen):
             btn_reset.bind(on_press=ask_reset)
             layout.add_widget(btn_reset)
 
+            btn_dismiss = Button(
+                text='✕  Abandonner',
+                size_hint_y=None, height=55,
+                background_color=(0.5, 0.5, 0.5, 1),
+                color=(1, 1, 1, 1),
+                font_size=16,
+                bold=True
+            )
+            def ask_dismiss(x):
+                confirm_popup(
+                    f"Abandonner cette tâche ?\n\n{title_task}\n\nElle sera conservée dans l'historique\nmais ne comptera pas comme faite.",
+                    lambda: self.do_dismiss(task_uid)
+                )
+            btn_dismiss.bind(on_press=ask_dismiss)
+            layout.add_widget(btn_dismiss)
+
         scroll.add_widget(layout)
         self.root.add_widget(scroll)
 
@@ -363,6 +379,20 @@ class DetailScreen(Screen):
         self.manager.transition.direction = 'left'
         self.load_task(btn.sub_data, from_parent_data=self.task_data)
         self.manager.current = 'detail'
+
+    def do_dismiss(self, task_uid):
+        """Abandonne une tâche — STATUS:CANCELLED, hors stats, dans l'historique."""
+        popup = loading_popup()
+        def _execute(dt):
+            from caldav_api import dismiss_task, fetch_tasks
+            dismiss_task(task_uid)
+            fetch_tasks()
+            popup.dismiss()
+            self.manager.get_screen('tags').build_ui()
+            self.manager.transition.direction = 'right'
+            self.manager.get_screen('tasks').load_tag(state.CURRENT_TAG)
+            self.manager.current = 'tasks'
+        Clock.schedule_once(_execute, 0.1)
 
     def do_delete(self, task_uid):
         popup = loading_popup()

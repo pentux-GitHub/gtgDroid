@@ -11,8 +11,8 @@ from widgets import loading_popup
 
 
 def is_actionable(task):
-    title, status, due_str, start_str, description, task_uid, priority = task
-    # Exclure Un jour
+    title, status, due_str, start_str, description, task_uid, priority, has_children = task
+    # Exclure "Un jour"
     if priority == 9:
         return False
     # Exclure si DTSTART dans le futur
@@ -38,7 +38,7 @@ class TagsScreen(Screen):
         self.clear_widgets()
         root = BoxLayout(orientation='vertical')
 
-        # Header
+        # ── HEADER ────────────────────────────────────────────────
         header = BoxLayout(size_hint_y=None, height=55, padding=[5, 5])
         header.add_widget(Label(
             text='gtgDroid',
@@ -46,7 +46,7 @@ class TagsScreen(Screen):
             color=(0.2, 0.5, 0.9, 1)
         ))
         btn_refresh = Button(
-            text='Rafraichir',
+            text='Rafraîchir',
             size_hint_x=0.35,
             background_color=(0.2, 0.5, 0.9, 1),
             color=(1, 1, 1, 1),
@@ -66,7 +66,7 @@ class TagsScreen(Screen):
         header.add_widget(btn_new)
         root.add_widget(header)
 
-        # Boutons de vue
+        # ── BOUTONS DE VUE ────────────────────────────────────────
         view_bar = BoxLayout(size_hint_y=None, height=45, spacing=3, padding=[5, 3])
 
         def make_view_btn(text, view_name):
@@ -86,14 +86,16 @@ class TagsScreen(Screen):
 
         view_bar.add_widget(make_view_btn('Ouvertes', 'open'))
         view_bar.add_widget(make_view_btn('Actionnables', 'actionable'))
-        view_bar.add_widget(make_view_btn('Fermees', 'closed'))
+        view_bar.add_widget(make_view_btn('Fermées', 'closed'))
+        view_bar.add_widget(make_view_btn('Abandonnées', 'dismissed'))
         root.add_widget(view_bar)
 
-        # Calcul des tags selon la vue
+        # ── CALCUL DES TAGS SELON LA VUE ──────────────────────────
         par_tag_view = {}
-
         if state.CURRENT_VIEW == 'closed':
             source = state.PAR_TAG_CLOSED
+        elif state.CURRENT_VIEW == 'dismissed':
+            source = state.PAR_TAG_DISMISSED
         else:
             source = state.PAR_TAG
 
@@ -105,15 +107,23 @@ class TagsScreen(Screen):
             if filtered:
                 par_tag_view[tag] = filtered
 
-        # Liste des tags
+        # ── LISTE DES TAGS ────────────────────────────────────────
         scroll = ScrollView()
         layout = GridLayout(cols=1, spacing=3, size_hint_y=None, padding=[10, 5])
         layout.bind(minimum_height=layout.setter('height'))
 
         for tag in sorted(par_tag_view.keys()):
-            nb = len(par_tag_view[tag])
+            taches = par_tag_view[tag]
+            nb = len(taches)
+
+            # Compter les tâches avec enfants pour info visuelle
+            nb_avec_enfants = sum(1 for t in taches if t[7])
+
+            # Indicateur si le tag contient des tâches parentes
+            indicateur = '  ▶' if nb_avec_enfants > 0 else ''
+
             btn = Button(
-                text=f"  #{tag}  ({nb})",
+                text=f"  #{tag}  ({nb}){indicateur}",
                 size_hint_y=None, height=55,
                 halign='left',
                 background_color=(1, 1, 1, 1),
@@ -122,13 +132,13 @@ class TagsScreen(Screen):
                 bold=True
             )
             btn.tag = tag
-            btn.tag_tasks = par_tag_view[tag]
+            btn.tag_tasks = taches
             btn.bind(on_press=self.go_to_tasks)
             layout.add_widget(btn)
 
         if not par_tag_view:
             layout.add_widget(Label(
-                text='Aucune tache dans cette vue.',
+                text='Aucune tâche dans cette vue.',
                 size_hint_y=None, height=55,
                 color=(0.5, 0.5, 0.5, 1),
                 font_size=15
@@ -141,9 +151,8 @@ class TagsScreen(Screen):
     def refresh(self, *args):
         popup = loading_popup()
         def do_refresh(dt):
-            from caldav_api import fetch_tasks, fetch_tasks_completed
-            state.PAR_TAG = fetch_tasks()
-            state.PAR_TAG_CLOSED = fetch_tasks_completed()
+            from caldav_api import fetch_all
+            fetch_all()
             popup.dismiss()
             self.build_ui()
         Clock.schedule_once(do_refresh, 0.1)

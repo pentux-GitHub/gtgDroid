@@ -55,6 +55,7 @@ def fetch_all():
 
     par_tag = defaultdict(list)
     par_tag_closed = defaultdict(list)
+    par_tag_dismissed = defaultdict(list)
     tags_par_uid = {}
     subtasks_raw = defaultdict(list)  # {parent_uid: [vtodo, ...]}
 
@@ -100,6 +101,9 @@ def fetch_all():
         if status == 'COMPLETED':
             for tag in tags_clean:
                 par_tag_closed[tag].append(tuple_tache)
+        elif status == 'CANCELLED':
+            for tag in tags_clean:
+                par_tag_dismissed[tag].append(tuple_tache)
         else:
             for tag in tags_clean:
                 par_tag[tag].append(tuple_tache)
@@ -126,6 +130,7 @@ def fetch_all():
     # Mise à jour atomique du state
     state.PAR_TAG = dict(par_tag)
     state.PAR_TAG_CLOSED = dict(par_tag_closed)
+    state.PAR_TAG_DISMISSED = dict(par_tag_dismissed)
     state.TAGS_PAR_UID = tags_par_uid
     state.SUBTASKS_PAR_UID = subtasks_par_uid
 
@@ -159,6 +164,20 @@ def mark_as_done(task_uid):
             vtodo = ical.walk('VTODO')[0]
             if str(vtodo.get('UID', '')) == task_uid:
                 todo.complete()
+                return True
+    return False
+
+
+def dismiss_task(task_uid):
+    """Abandonne une tâche — STATUS:CANCELLED, distincte de COMPLETED."""
+    principal = get_client().principal()
+    for calendar in principal.calendars():
+        for todo in calendar.todos(include_completed=False):
+            ical = todo.icalendar_instance
+            vtodo = ical.walk('VTODO')[0]
+            if str(vtodo.get('UID', '')) == task_uid:
+                vtodo['STATUS'] = 'CANCELLED'
+                todo.save()
                 return True
     return False
 
