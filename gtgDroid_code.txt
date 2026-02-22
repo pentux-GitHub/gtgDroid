@@ -1,0 +1,2634 @@
+========== ./caldav_api.py ==========
+import caldav
+from icalendar import Calendar, Todo
+from datetime import datetime
+import uuid
+from collections import defaultdict
+from config import URL, USERNAME, PASSWORD
+from models import Task
+import state
+
+
+def get_client():
+    return caldav.DAVClient(url=URL, username=USERNAME, password=PASSWORD)
+
+
+# Tags à ignorer — ajoutés automatiquement par GTG
+_TAGS_IGNORES = {'DAV_gtg', '@DAV_gtg'}
+
+
+def _clean_tags(tags):
+    """
+    Nettoie la liste des tags :
+    - Retire le @ en début de tag
+    - Filtre les tags techniques de GTG (DAV_gtg)
+    - Retourne ['Sans tag'] si la liste est vide après nettoyage
+    """
+    result = []
+    for t in tags:
+        t_clean = t.lstrip('@')
+        if t_clean and t_clean not in _TAGS_IGNORES:
+            result.append(t_clean)
+    return result if result else ['Sans tag']
+
+
+def _parse_tags(tag_str):
+    """
+    Convertit une saisie utilisateur 'IT, urgent, @perso'
+    en liste propre ['IT', 'urgent', 'perso'].
+    """
+    if not tag_str or not tag_str.strip():
+        return []
+    parts = [t.strip().lstrip('@') for t in tag_str.split(',')]
+    return [t for t in parts if t and t not in _TAGS_IGNORES]
+
+
+def fetch_all():
+    """
+    Fetch principal — UN SEUL passage sur Nextcloud.
+    Remplit simultanément :
+      - state.PAR_TAG          (tâches ouvertes par tag)
+      - state.PAR_TAG_CLOSED   (tâches fermées par tag)
+      - state.TAGS_PAR_UID     (tous les tags par uid)
+      - state.SUBTASKS_PAR_UID (sous-tâches par uid parent)
+    Zéro appel réseau supplémentaire nécessaire dans les écrans.
+    """
+    principal = get_client().principal()
+
+    par_tag = defaultdict(list)
+    par_tag_closed = defaultdict(list)
+    par_tag_dismissed = defaultdict(list)
+    tags_par_uid = {}
+    subtasks_raw = defaultdict(list)  # {parent_uid: [vtodo, ...]}
+
+    # Passage unique sur TOUTES les tâches
+    all_vtodos = []
+    for calendar in principal.calendars():
+        for todo in calendar.todos(include_completed=True):
+            ical = todo.icalendar_instance
+            vtodo = ical.walk('VTODO')[0]
+            all_vtodos.append(vtodo)
+
+    # Étape 1 : identifier les parents et regrouper les sous-tâches
+    parents_set = set()
+    for vtodo in all_vtodos:
+        related = vtodo.get('RELATED-TO', None)
+        if related:
+            parent_uid = str(related)
+            parents_set.add(parent_uid)
+            subtasks_raw[parent_uid].append(vtodo)
+
+    # Étape 2 : construire les objets Task et remplir PAR_TAG, PAR_TAG_CLOSED, TAGS_PAR_UID
+    for vtodo in all_vtodos:
+        title = str(vtodo.get('SUMMARY', 'Sans titre'))
+        status = str(vtodo.get('STATUS', 'NEEDS-ACTION'))
+        due = vtodo.get('DUE', None)
+        due_str = due.dt.strftime('%d/%m/%Y') if due else ''
+        start = vtodo.get('DTSTART', None)
+        start_str = start.dt.strftime('%d/%m/%Y') if start else ''
+        description = str(vtodo.get('DESCRIPTION', ''))
+        task_uid = str(vtodo.get('UID', ''))
+        priority = int(vtodo.get('PRIORITY', 0))
+        fuzzy = str(vtodo.get('X-GTG-FUZZY', ''))
+        categories = vtodo.get('CATEGORIES', None)
+        tags = [str(c) for c in categories.cats] if categories else []
+        tags_clean = _clean_tags(tags)
+        has_children = task_uid in parents_set
+
+        # Cache tags par uid — string "IT, urgent"
+        tags_str = ', '.join(t for t in tags_clean if t != 'Sans tag')
+        tags_par_uid[task_uid] = tags_str
+
+        task = Task(
+            title=title,
+            status=status,
+            due_str=due_str,
+            start_str=start_str,
+            description=description,
+            task_uid=task_uid,
+            priority=priority,
+            has_children=has_children,
+            fuzzy=fuzzy,
+            tags=tags_str
+        )
+
+        if status == 'COMPLETED':
+            for tag in tags_clean:
+                par_tag_closed[tag].append(task)
+        elif status == 'CANCELLED':
+            for tag in tags_clean:
+                par_tag_dismissed[tag].append(task)
+        else:
+            for tag in tags_clean:
+                par_tag[tag].append(task)
+
+    # Étape 3 : construire le cache des sous-tâches triées A→Z
+    subtasks_par_uid = {}
+    for parent_uid, vtodo_list in subtasks_raw.items():
+        subtasks = []
+        for vtodo in vtodo_list:
+            title = str(vtodo.get('SUMMARY', 'Sans titre'))
+            status = str(vtodo.get('STATUS', 'NEEDS-ACTION'))
+            due = vtodo.get('DUE', None)
+            due_str = due.dt.strftime('%d/%m/%Y') if due else ''
+            start = vtodo.get('DTSTART', None)
+            start_str = start.dt.strftime('%d/%m/%Y') if start else ''
+            description = str(vtodo.get('DESCRIPTION', ''))
+            task_uid = str(vtodo.get('UID', ''))
+            priority = int(vtodo.get('PRIORITY', 0))
+            fuzzy = str(vtodo.get('X-GTG-FUZZY', ''))
+            has_children = task_uid in parents_set
+            subtasks.append(Task(
+                title=title, status=status, due_str=due_str,
+                start_str=start_str, description=description,
+                task_uid=task_uid, priority=priority,
+                has_children=has_children, fuzzy=fuzzy
+            ))
+        subtasks.sort(key=lambda t: t.title)
+        subtasks_par_uid[parent_uid] = subtasks
+
+    # Mise à jour atomique du state
+    state.PAR_TAG = dict(par_tag)
+    state.PAR_TAG_CLOSED = dict(par_tag_closed)
+    state.PAR_TAG_DISMISSED = dict(par_tag_dismissed)
+    state.TAGS_PAR_UID = tags_par_uid
+    state.SUBTASKS_PAR_UID = subtasks_par_uid
+
+
+def fetch_tasks():
+    """Appelle fetch_all() et retourne PAR_TAG."""
+    fetch_all()
+    return state.PAR_TAG
+
+
+def fetch_tasks_completed():
+    """Retourne PAR_TAG_CLOSED — déjà rempli par fetch_all()."""
+    return state.PAR_TAG_CLOSED
+
+
+def fetch_subtasks(parent_uid):
+    """Retourne les sous-tâches depuis le cache — zéro appel réseau."""
+    return state.SUBTASKS_PAR_UID.get(parent_uid, [])
+
+
+def fetch_tags_for_uid(task_uid):
+    """Retourne les tags depuis le cache — zéro appel réseau."""
+    return state.TAGS_PAR_UID.get(task_uid, '')
+
+
+def mark_as_done(task_uid):
+    principal = get_client().principal()
+    for calendar in principal.calendars():
+        for todo in calendar.todos(include_completed=False):
+            ical = todo.icalendar_instance
+            vtodo = ical.walk('VTODO')[0]
+            if str(vtodo.get('UID', '')) == task_uid:
+                todo.complete()
+                return True
+    return False
+
+
+def dismiss_task(task_uid):
+    """Abandonne une tâche — STATUS:CANCELLED, distincte de COMPLETED."""
+    principal = get_client().principal()
+    for calendar in principal.calendars():
+        for todo in calendar.todos(include_completed=False):
+            ical = todo.icalendar_instance
+            vtodo = ical.walk('VTODO')[0]
+            if str(vtodo.get('UID', '')) == task_uid:
+                vtodo['STATUS'] = 'CANCELLED'
+                todo.save()
+                return True
+    return False
+
+
+def delete_task(task_uid):
+    principal = get_client().principal()
+    for calendar in principal.calendars():
+        for todo in calendar.todos(include_completed=False):
+            ical = todo.icalendar_instance
+            vtodo = ical.walk('VTODO')[0]
+            if str(vtodo.get('UID', '')) == task_uid:
+                todo.delete()
+                return True
+    return False
+
+
+def create_task(title, tags=None, start=None, due=None, description='', priority=0):
+    """tags peut être une string 'IT, urgent' ou une liste ['IT', 'urgent']"""
+    principal = get_client().principal()
+    for calendar in principal.calendars():
+        if calendar.name == 'gtg':
+            new_uid = str(uuid.uuid4())
+            cal = Calendar()
+            cal.add('prodid', '-//gtgDroid//FR')
+            cal.add('version', '2.0')
+            todo = Todo()
+            todo.add('uid', new_uid)
+            todo.add('summary', title)
+            todo.add('status', 'NEEDS-ACTION')
+            todo.add('created', datetime.now())
+            if description:
+                todo.add('description', description)
+            if isinstance(tags, str):
+                tag_list = _parse_tags(tags)
+            elif isinstance(tags, list):
+                tag_list = [t.lstrip('@') for t in tags if t]
+            else:
+                tag_list = []
+            if tag_list:
+                todo.add('categories', tag_list)
+            if start:
+                todo.add('dtstart', datetime.strptime(start, '%d/%m/%Y').date())
+            if due:
+                todo.add('due', datetime.strptime(due, '%d/%m/%Y').date())
+            if priority:
+                todo.add('priority', priority)
+            cal.add_component(todo)
+            calendar.add_todo(cal.to_ical().decode('utf-8'))
+            return new_uid
+    return None
+
+
+def create_subtask(parent_uid, title, tags=None, start=None, due=None, description='', priority=0):
+    """Crée une sous-tâche liée à une tâche parent via RELATED-TO."""
+    principal = get_client().principal()
+    for calendar in principal.calendars():
+        if calendar.name == 'gtg':
+            new_uid = str(uuid.uuid4())
+            cal = Calendar()
+            cal.add('prodid', '-//gtgDroid//FR')
+            cal.add('version', '2.0')
+            todo = Todo()
+            todo.add('uid', new_uid)
+            todo.add('summary', title)
+            todo.add('status', 'NEEDS-ACTION')
+            todo.add('created', datetime.now())
+            todo.add('related-to', parent_uid)
+            if description:
+                todo.add('description', description)
+            if isinstance(tags, str):
+                tag_list = _parse_tags(tags)
+            elif isinstance(tags, list):
+                tag_list = [t.lstrip('@') for t in tags if t]
+            else:
+                tag_list = []
+            if tag_list:
+                todo.add('categories', tag_list)
+            if start:
+                todo.add('dtstart', datetime.strptime(start, '%d/%m/%Y').date())
+            if due:
+                todo.add('due', datetime.strptime(due, '%d/%m/%Y').date())
+            if priority:
+                todo.add('priority', priority)
+            cal.add_component(todo)
+            calendar.add_todo(cal.to_ical().decode('utf-8'))
+            return new_uid
+    return None
+
+
+def update_task(task_uid, new_title, new_tags=None, new_start=None, new_due=None, new_description='', new_priority=0):
+    principal = get_client().principal()
+    for calendar in principal.calendars():
+        for todo in calendar.todos(include_completed=False):
+            ical = todo.icalendar_instance
+            vtodo = ical.walk('VTODO')[0]
+            if str(vtodo.get('UID', '')) == task_uid:
+                vtodo['SUMMARY'] = new_title
+                if new_description:
+                    vtodo['DESCRIPTION'] = new_description
+                elif 'DESCRIPTION' in vtodo:
+                    del vtodo['DESCRIPTION']
+                if isinstance(new_tags, str):
+                    tag_list = _parse_tags(new_tags)
+                elif isinstance(new_tags, list):
+                    tag_list = [t.lstrip('@') for t in new_tags if t]
+                else:
+                    tag_list = []
+                if tag_list:
+                    vtodo['CATEGORIES'] = ','.join(tag_list)
+                elif 'CATEGORIES' in vtodo:
+                    del vtodo['CATEGORIES']
+                if new_start:
+                    from icalendar import vDatetime
+                    from datetime import timezone
+                    dt = datetime.strptime(new_start, '%d/%m/%Y').replace(tzinfo=timezone.utc)
+                    vtodo['DTSTART'] = vDatetime(dt)
+                elif 'DTSTART' in vtodo:
+                    del vtodo['DTSTART']
+                if new_due:
+                    from icalendar import vDatetime
+                    from datetime import timezone
+                    dt = datetime.strptime(new_due, '%d/%m/%Y').replace(tzinfo=timezone.utc)
+                    vtodo['DUE'] = vDatetime(dt)
+                elif 'DUE' in vtodo:
+                    del vtodo['DUE']
+                if new_priority:
+                    vtodo['PRIORITY'] = new_priority
+                elif 'PRIORITY' in vtodo:
+                    del vtodo['PRIORITY']
+                todo.save()
+                return True
+    return False
+
+
+def reset_and_clone_task(task_uid):
+    """
+    Réinitialise une tâche récurrente (non cyclique) :
+    - Archive la tâche et ses sous-tâches (COMPLETED)
+    - Recrée une copie fraîche avec PRIORITY=9 (Un jour), sans dates
+    - Recrée toutes les sous-tâches fraîches liées au nouveau parent
+    """
+    principal = get_client().principal()
+
+    parent_todo = None
+    parent_vtodo = None
+    for calendar in principal.calendars():
+        for todo in calendar.todos(include_completed=False):
+            ical = todo.icalendar_instance
+            vtodo = ical.walk('VTODO')[0]
+            if str(vtodo.get('UID', '')) == task_uid:
+                parent_todo = todo
+                parent_vtodo = vtodo
+                break
+        if parent_todo:
+            break
+
+    if not parent_todo:
+        return None
+
+    parent_title = str(parent_vtodo.get('SUMMARY', 'Sans titre'))
+    parent_description = str(parent_vtodo.get('DESCRIPTION', ''))
+    parent_categories = parent_vtodo.get('CATEGORIES', None)
+    parent_tags = []
+    if parent_categories:
+        parent_tags = _clean_tags([str(c) for c in parent_categories.cats])
+        parent_tags = [t for t in parent_tags if t != 'Sans tag']
+
+    subtasks_data = fetch_subtasks(task_uid)
+    parent_todo.complete()
+    for subtask in subtasks_data:
+        mark_as_done(subtask[5])
+
+    new_parent_uid = create_task(
+        title=parent_title,
+        tags=parent_tags,
+        description=parent_description if parent_description != 'None' else '',
+        priority=9
+    )
+
+    if not new_parent_uid:
+        return None
+
+    for subtask in subtasks_data:
+        create_subtask(
+            parent_uid=new_parent_uid,
+            title=subtask[0],
+            tags=parent_tags,
+            description=subtask[4] if subtask[4] != 'None' else ''
+        )
+
+    return new_parent_uid
+========== ./config.py ==========
+URL = 'https://nuage.globenet.org/remote.php/dav/'
+USERNAME = 'ereethique'
+PASSWORD = 'XXsEO_$/{BXw:kmgvK&I.j:F/tI{.;'
+
+
+========== ./config-sample.py ==========
+# config-sample.py — Exemple de configuration pour gtgDroid
+# ─────────────────────────────────────────────────────────────
+# Copier ce fichier en config.py et remplir vos informations.
+# Ne jamais committer config.py — il contient vos credentials.
+#
+# cp config-sample.py config.py
+
+# URL de votre serveur CalDAV
+# Nextcloud : https://votre-instance.example.com/remote.php/dav
+# Format attendu : avec le /remote.php/dav/ final
+URL = 'https://votre-nextcloud.example.com/remote.php/dav/'
+
+# Nom d'utilisateur Nextcloud
+USERNAME = 'votre_utilisateur'
+
+# Mot de passe Nextcloud (ou mot de passe d'application recommandé)
+# Générer un mot de passe d'application dans :
+# Nextcloud → Paramètres → Sécurité → Appareils et sessions
+PASSWORD = 'votre_mot_de_passe'
+
+# Nom du calendrier CalDAV utilisé par GTG (ne pas modifier sauf cas particulier)
+# GTG crée automatiquement un calendrier nommé 'gtg' lors de la première synchro
+CALENDAR_NAME = 'gtg'
+
+========== ./gtgDroid.py ==========
+from kivy.app import App
+from kivy.uix.label import Label
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
+from kivy.uix.textinput import TextInput
+from kivy.uix.popup import Popup
+from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition
+from kivy.core.window import Window
+from kivy.clock import Clock
+import caldav
+from icalendar import Calendar, Todo
+from datetime import datetime
+import uuid
+from collections import defaultdict
+from config import URL, USERNAME, PASSWORD
+
+Window.clearcolor = (0.95, 0.95, 0.95, 1)
+
+def get_client():
+    return caldav.DAVClient(url=URL, username=USERNAME, password=PASSWORD)
+
+def fetch_tasks():
+    principal = get_client().principal()
+    par_tag = defaultdict(list)
+    for calendar in principal.calendars():
+        for todo in calendar.todos(include_completed=False):
+            ical = todo.icalendar_instance
+            vtodo = ical.walk('VTODO')[0]
+            title = str(vtodo.get('SUMMARY', 'Sans titre'))
+            status = str(vtodo.get('STATUS', 'NEEDS-ACTION'))
+            due = vtodo.get('DUE', None)
+            due_str = due.dt.strftime('%d/%m/%Y') if due else ''
+            description = str(vtodo.get('DESCRIPTION', ''))
+            task_uid = str(vtodo.get('UID', ''))
+            categories = vtodo.get('CATEGORIES', None)
+            tags = [str(c) for c in categories.cats] if categories else ['Sans tag']
+            for tag in tags:
+                par_tag[tag].append((title, status, due_str, description, task_uid))
+    return par_tag
+
+def mark_as_done(task_uid):
+    principal = get_client().principal()
+    for calendar in principal.calendars():
+        for todo in calendar.todos(include_completed=False):
+            ical = todo.icalendar_instance
+            vtodo = ical.walk('VTODO')[0]
+            if str(vtodo.get('UID', '')) == task_uid:
+                todo.complete()
+                return True
+    return False
+
+def delete_task(task_uid):
+    principal = get_client().principal()
+    for calendar in principal.calendars():
+        for todo in calendar.todos(include_completed=False):
+            ical = todo.icalendar_instance
+            vtodo = ical.walk('VTODO')[0]
+            if str(vtodo.get('UID', '')) == task_uid:
+                todo.delete()
+                return True
+    return False
+
+def create_task(title, tag=None, description=''):
+    principal = get_client().principal()
+    for calendar in principal.calendars():
+        if calendar.name == 'gtg':
+            cal = Calendar()
+            cal.add('prodid', '-//gtgDroid//FR')
+            cal.add('version', '2.0')
+            todo = Todo()
+            todo.add('uid', str(uuid.uuid4()))
+            todo.add('summary', title)
+            todo.add('status', 'NEEDS-ACTION')
+            todo.add('created', datetime.now())
+            if description:
+                todo.add('description', description)
+            if tag and tag != 'Sans tag':
+                todo.add('categories', [tag])
+            cal.add_component(todo)
+            calendar.add_todo(cal.to_ical().decode('utf-8'))
+            return True
+    return False
+
+def update_task(task_uid, new_title, new_tag=None, new_description=''):
+    principal = get_client().principal()
+    for calendar in principal.calendars():
+        for todo in calendar.todos(include_completed=False):
+            ical = todo.icalendar_instance
+            vtodo = ical.walk('VTODO')[0]
+            if str(vtodo.get('UID', '')) == task_uid:
+                vtodo['SUMMARY'] = new_title
+                if new_description:
+                    vtodo['DESCRIPTION'] = new_description
+                elif 'DESCRIPTION' in vtodo:
+                    del vtodo['DESCRIPTION']
+                if new_tag and new_tag != 'Sans tag':
+                    vtodo['CATEGORIES'] = new_tag
+                elif 'CATEGORIES' in vtodo:
+                    del vtodo['CATEGORIES']
+                todo.save()
+                return True
+    return False
+
+PAR_TAG = {}
+CURRENT_TAG = ''
+
+def confirm_popup(message, on_confirm):
+    content = BoxLayout(orientation='vertical', padding=10, spacing=10)
+    content.add_widget(Label(text=message, halign='center'))
+    buttons = BoxLayout(size_hint_y=None, height=45, spacing=10)
+    popup = Popup(
+        title='Confirmation',
+        content=content,
+        size_hint=(0.8, 0.35),
+        auto_dismiss=False
+    )
+    btn_oui = Button(text='Oui', background_color=(0.8, 0.2, 0.2, 1), color=(1, 1, 1, 1))
+    btn_non = Button(text='Non', background_color=(0.4, 0.4, 0.4, 1), color=(1, 1, 1, 1))
+    def do_confirm(x):
+        popup.dismiss()
+        on_confirm()
+    btn_oui.bind(on_press=do_confirm)
+    btn_non.bind(on_press=popup.dismiss)
+    buttons.add_widget(btn_oui)
+    buttons.add_widget(btn_non)
+    content.add_widget(buttons)
+    popup.open()
+
+def loading_popup():
+    content = BoxLayout(orientation='vertical', padding=10)
+    content.add_widget(Label(text='Actualisation en cours...', halign='center'))
+    popup = Popup(
+        title='',
+        content=content,
+        size_hint=(0.6, 0.2),
+        auto_dismiss=False
+    )
+    popup.open()
+    return popup
+
+class LoadingScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        layout = BoxLayout(orientation='vertical')
+        layout.add_widget(Label(
+            text='gtgDroid',
+            bold=True, font_size=28,
+            color=(0.2, 0.5, 0.9, 1)
+        ))
+        self.status = Label(
+            text='Connexion a Nextcloud...',
+            font_size=15,
+            color=(0.4, 0.4, 0.4, 1)
+        )
+        layout.add_widget(self.status)
+        self.add_widget(layout)
+
+    def on_enter(self):
+        Clock.schedule_once(self.load_data, 0.3)
+
+    def load_data(self, dt):
+        self.status.text = 'Chargement des taches...'
+        Clock.schedule_once(self._do_fetch, 0.1)
+
+    def _do_fetch(self, dt):
+        global PAR_TAG
+        PAR_TAG = fetch_tasks()
+        self.manager.get_screen('tags').build_ui()
+        self.manager.transition.direction = 'left'
+        self.manager.current = 'tags'
+
+class TagsScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def build_ui(self):
+        self.clear_widgets()
+        root = BoxLayout(orientation='vertical')
+
+        header = BoxLayout(size_hint_y=None, height=55, padding=[5, 5])
+        header.add_widget(Label(
+            text='gtgDroid',
+            bold=True, font_size=22,
+            color=(0.2, 0.5, 0.9, 1)
+        ))
+        btn_refresh = Button(
+            text='Rafraichir',
+            size_hint_x=0.35,
+            background_color=(0.2, 0.5, 0.9, 1),
+            color=(1, 1, 1, 1),
+            font_size=13
+        )
+        btn_refresh.bind(on_press=self.refresh)
+        btn_new = Button(
+            text='  +  ',
+            size_hint_x=0.15,
+            background_color=(0.2, 0.7, 0.3, 1),
+            color=(1, 1, 1, 1),
+            font_size=20,
+            bold=True
+        )
+        btn_new.bind(on_press=self.go_to_new)
+        header.add_widget(btn_refresh)
+        header.add_widget(btn_new)
+        root.add_widget(header)
+
+        scroll = ScrollView()
+        layout = GridLayout(cols=1, spacing=3, size_hint_y=None, padding=[10, 5])
+        layout.bind(minimum_height=layout.setter('height'))
+
+        for tag in sorted(PAR_TAG.keys()):
+            nb = len(PAR_TAG[tag])
+            btn = Button(
+                text=f"  #{tag}  ({nb})",
+                size_hint_y=None, height=55,
+                halign='left',
+                background_color=(1, 1, 1, 1),
+                color=(0.2, 0.5, 0.9, 1),
+                font_size=16,
+                bold=True
+            )
+            btn.tag = tag
+            btn.bind(on_press=self.go_to_tasks)
+            layout.add_widget(btn)
+
+        scroll.add_widget(layout)
+        root.add_widget(scroll)
+        self.add_widget(root)
+
+    def refresh(self, *args):
+        popup = loading_popup()
+        def do_refresh(dt):
+            global PAR_TAG
+            PAR_TAG = fetch_tasks()
+            popup.dismiss()
+            self.build_ui()
+        Clock.schedule_once(do_refresh, 0.1)
+
+    def go_to_tasks(self, btn):
+        global CURRENT_TAG
+        CURRENT_TAG = btn.tag
+        self.manager.transition.direction = 'left'
+        self.manager.get_screen('tasks').load_tag(btn.tag)
+        self.manager.current = 'tasks'
+
+    def go_to_new(self, btn):
+        self.manager.transition.direction = 'left'
+        self.manager.get_screen('new').load_form()
+        self.manager.current = 'new'
+
+class TasksScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.root = BoxLayout(orientation='vertical')
+        self.add_widget(self.root)
+
+    def load_tag(self, tag):
+        self.root.clear_widgets()
+
+        header = BoxLayout(size_hint_y=None, height=55, padding=[5, 5])
+        btn_back = Button(
+            text='< Retour',
+            size_hint_x=0.3,
+            background_color=(0.2, 0.5, 0.9, 1),
+            color=(1, 1, 1, 1),
+            font_size=14
+        )
+        def go_back(x):
+            self.manager.transition.direction = 'right'
+            self.manager.current = 'tags'
+        btn_back.bind(on_press=go_back)
+        header.add_widget(btn_back)
+        header.add_widget(Label(
+            text=f"#{tag}",
+            bold=True, font_size=18,
+            color=(0.2, 0.5, 0.9, 1)
+        ))
+        self.root.add_widget(header)
+
+        scroll = ScrollView()
+        layout = GridLayout(cols=1, spacing=2, size_hint_y=None, padding=[10, 5])
+        layout.bind(minimum_height=layout.setter('height'))
+
+        taches = sorted(PAR_TAG[tag], key=lambda x: x[2] or 'zzz')
+        for title_task, status, due_str, description, task_uid in taches:
+            icone = 'OK' if status == 'COMPLETED' else 'o'
+            date = f"   {due_str}" if due_str else ''
+            btn = Button(
+                text=f"  {icone}  {title_task}{date}",
+                size_hint_y=None, height=50,
+                halign='left',
+                background_color=(1, 1, 1, 1),
+                color=(0.1, 0.1, 0.1, 1),
+                font_size=15
+            )
+            btn.task_data = (title_task, status, due_str, description, task_uid)
+            btn.bind(on_press=self.go_to_detail)
+            layout.add_widget(btn)
+
+        scroll.add_widget(layout)
+        self.root.add_widget(scroll)
+
+    def go_to_detail(self, btn):
+        self.manager.transition.direction = 'left'
+        self.manager.get_screen('detail').load_task(btn.task_data)
+        self.manager.current = 'detail'
+
+class NewTaskScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.root = BoxLayout(orientation='vertical')
+        self.add_widget(self.root)
+        self.edit_uid = None
+
+    def load_form(self, default_tag='', edit_data=None):
+        self.root.clear_widgets()
+        self.edit_uid = edit_data[4] if edit_data else None
+
+        header = BoxLayout(size_hint_y=None, height=55, padding=[5, 5])
+        btn_back = Button(
+            text='< Retour',
+            size_hint_x=0.3,
+            background_color=(0.2, 0.5, 0.9, 1),
+            color=(1, 1, 1, 1),
+            font_size=14
+        )
+        def go_back(x):
+            self.manager.transition.direction = 'right'
+            if self.edit_uid:
+                self.manager.current = 'detail'
+            else:
+                self.manager.current = 'tags'
+        btn_back.bind(on_press=go_back)
+        header.add_widget(btn_back)
+        header.add_widget(Label(
+            text='Modifier' if edit_data else 'Nouvelle tache',
+            bold=True, font_size=18,
+            color=(0.2, 0.5, 0.9, 1)
+        ))
+        self.root.add_widget(header)
+
+        layout = GridLayout(cols=1, spacing=12, size_hint_y=None, padding=[15, 10])
+        layout.bind(minimum_height=layout.setter('height'))
+
+        layout.add_widget(Label(
+            text='Titre',
+            size_hint_y=None, height=30,
+            halign='left', valign='middle',
+            text_size=(750, 30),
+            color=(0.3, 0.3, 0.3, 1),
+            bold=True
+        ))
+        self.input_title = TextInput(
+            hint_text='Titre de la tache...',
+            text=edit_data[0] if edit_data else '',
+            size_hint_y=None, height=50,
+            multiline=False,
+            font_size=15
+        )
+        layout.add_widget(self.input_title)
+
+        layout.add_widget(Label(
+            text='Tag (optionnel)',
+            size_hint_y=None, height=30,
+            halign='left', valign='middle',
+            text_size=(750, 30),
+            color=(0.3, 0.3, 0.3, 1),
+            bold=True
+        ))
+        current_tag = ''
+        if edit_data:
+            for tag, taches in PAR_TAG.items():
+                for t in taches:
+                    if t[4] == edit_data[4]:
+                        current_tag = tag if tag != 'Sans tag' else ''
+                        break
+        self.input_tag = TextInput(
+            hint_text='ex: TVX, IT, Home...',
+            text=current_tag or default_tag,
+            size_hint_y=None, height=50,
+            multiline=False,
+            font_size=15
+        )
+        layout.add_widget(self.input_tag)
+
+        layout.add_widget(Label(
+            text='Notes (optionnel)',
+            size_hint_y=None, height=30,
+            halign='left', valign='middle',
+            text_size=(750, 30),
+            color=(0.3, 0.3, 0.3, 1),
+            bold=True
+        ))
+        desc = edit_data[3] if edit_data and edit_data[3] != 'None' else ''
+        self.input_desc = TextInput(
+            hint_text='Notes...',
+            text=desc,
+            size_hint_y=None, height=120,
+            multiline=True,
+            font_size=15
+        )
+        layout.add_widget(self.input_desc)
+
+        btn_save = Button(
+            text='Enregistrer' if edit_data else 'Creer la tache',
+            size_hint_y=None, height=55,
+            background_color=(0.2, 0.7, 0.3, 1),
+            color=(1, 1, 1, 1),
+            font_size=16,
+            bold=True
+        )
+        btn_save.bind(on_press=self.save_task)
+        layout.add_widget(btn_save)
+
+        scroll = ScrollView()
+        scroll.add_widget(layout)
+        self.root.add_widget(scroll)
+
+    def save_task(self, btn):
+        title = self.input_title.text.strip()
+        if not title:
+            return
+        tag = self.input_tag.text.strip() or None
+        desc = self.input_desc.text.strip()
+
+        popup = loading_popup()
+        def do_save(dt):
+            global PAR_TAG
+            if self.edit_uid:
+                update_task(self.edit_uid, title, tag, desc)
+            else:
+                create_task(title, tag, desc)
+            PAR_TAG = fetch_tasks()
+            popup.dismiss()
+            self.manager.get_screen('tags').build_ui()
+            self.manager.transition.direction = 'right'
+            self.manager.current = 'tags'
+        Clock.schedule_once(do_save, 0.1)
+
+class DetailScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.root = BoxLayout(orientation='vertical')
+        self.add_widget(self.root)
+        self._cancel_event = None
+        self._pending_uid = None
+
+    def load_task(self, task_data):
+        self.root.clear_widgets()
+        self.task_data = task_data
+        title_task, status, due_str, description, task_uid = task_data
+
+        header = BoxLayout(size_hint_y=None, height=55, padding=[5, 5])
+        btn_back = Button(
+            text='< Retour',
+            size_hint_x=0.25,
+            background_color=(0.2, 0.5, 0.9, 1),
+            color=(1, 1, 1, 1),
+            font_size=14
+        )
+        def go_back(x):
+            if self._cancel_event:
+                self._cancel_event.cancel()
+                self._cancel_event = None
+                self._pending_uid = None
+            self.manager.transition.direction = 'right'
+            self.manager.current = 'tasks'
+        btn_back.bind(on_press=go_back)
+
+        btn_edit = Button(
+            text='Modifier',
+            size_hint_x=0.25,
+            background_color=(0.5, 0.5, 0.5, 1),
+            color=(1, 1, 1, 1),
+            font_size=14
+        )
+        def go_edit(x):
+            self.manager.transition.direction = 'left'
+            self.manager.get_screen('new').load_form(edit_data=self.task_data)
+            self.manager.current = 'new'
+        btn_edit.bind(on_press=go_edit)
+
+        btn_delete = Button(
+            text='Supprimer',
+            size_hint_x=0.25,
+            background_color=(0.8, 0.2, 0.2, 1),
+            color=(1, 1, 1, 1),
+            font_size=14
+        )
+        def ask_delete(x):
+            confirm_popup(
+                f"Supprimer definitivement ?\n\n{title_task}",
+                lambda: self.do_delete(task_uid)
+            )
+        btn_delete.bind(on_press=ask_delete)
+
+        header.add_widget(btn_back)
+        header.add_widget(Label(
+            text='Detail',
+            bold=True, font_size=16,
+            color=(0.2, 0.5, 0.9, 1)
+        ))
+        header.add_widget(btn_edit)
+        header.add_widget(btn_delete)
+        self.root.add_widget(header)
+
+        scroll = ScrollView()
+        layout = GridLayout(cols=1, spacing=10, size_hint_y=None, padding=[15, 10])
+        layout.bind(minimum_height=layout.setter('height'))
+
+        layout.add_widget(Label(
+            text=title_task,
+            bold=True, font_size=20,
+            size_hint_y=None, height=60,
+            halign='left', valign='middle',
+            text_size=(750, 60),
+            color=(0.1, 0.1, 0.1, 1)
+        ))
+
+        icone = 'OK' if status == 'COMPLETED' else 'o'
+        layout.add_widget(Label(
+            text=f"Statut : {icone}  {status}",
+            size_hint_y=None, height=40,
+            halign='left', valign='middle',
+            text_size=(750, 40),
+            color=(0.3, 0.3, 0.3, 1),
+            font_size=15
+        ))
+
+        if due_str:
+            layout.add_widget(Label(
+                text=f"Echeance : {due_str}",
+                size_hint_y=None, height=40,
+                halign='left', valign='middle',
+                text_size=(750, 40),
+                color=(0.2, 0.5, 0.9, 1),
+                font_size=15
+            ))
+
+        if description and description != 'None':
+            layout.add_widget(Label(
+                text=f"Notes :\n{description}",
+                size_hint_y=None, height=200,
+                halign='left', valign='top',
+                text_size=(750, 200),
+                color=(0.3, 0.3, 0.3, 1),
+                font_size=14
+            ))
+
+        if status != 'COMPLETED':
+            self.btn_done = Button(
+                text='Marquer comme faite',
+                size_hint_y=None, height=55,
+                background_color=(0.2, 0.7, 0.3, 1),
+                color=(1, 1, 1, 1),
+                font_size=16,
+                bold=True
+            )
+            self.btn_done.task_uid = task_uid
+            self.btn_done.task_title = title_task
+
+            def ask_confirm(btn):
+                confirm_popup(
+                    f"Marquer comme faite ?\n\n{btn.task_title}",
+                    lambda: self.start_countdown(btn.task_uid)
+                )
+            self.btn_done.bind(on_press=ask_confirm)
+            layout.add_widget(self.btn_done)
+
+            self.btn_cancel = Button(
+                text='Annuler (3)',
+                size_hint_y=None, height=55,
+                background_color=(0.8, 0.4, 0.1, 1),
+                color=(1, 1, 1, 1),
+                font_size=16,
+                bold=True,
+                opacity=0,
+                disabled=True
+            )
+            self.btn_cancel.bind(on_press=self.cancel_done)
+            layout.add_widget(self.btn_cancel)
+
+        scroll.add_widget(layout)
+        self.root.add_widget(scroll)
+
+    def do_delete(self, task_uid):
+        popup = loading_popup()
+        def _delete(dt):
+            global PAR_TAG
+            delete_task(task_uid)
+            PAR_TAG = fetch_tasks()
+            popup.dismiss()
+            self.manager.get_screen('tags').build_ui()
+            self.manager.transition.direction = 'right'
+            self.manager.get_screen('tasks').load_tag(CURRENT_TAG)
+            self.manager.current = 'tasks'
+        Clock.schedule_once(_delete, 0.1)
+
+    def start_countdown(self, task_uid):
+        self._pending_uid = task_uid
+        self._countdown = 3
+        self.btn_done.disabled = True
+        self.btn_done.opacity = 0
+        self.btn_cancel.disabled = False
+        self.btn_cancel.opacity = 1
+        self.btn_cancel.text = f'Annuler ({self._countdown})'
+        self._cancel_event = Clock.schedule_interval(self._tick, 1)
+
+    def _tick(self, dt):
+        self._countdown -= 1
+        if self._countdown > 0:
+            self.btn_cancel.text = f'Annuler ({self._countdown})'
+        else:
+            self._cancel_event.cancel()
+            self._cancel_event = None
+            self._execute_done()
+
+    def cancel_done(self, *args):
+        if self._cancel_event:
+            self._cancel_event.cancel()
+            self._cancel_event = None
+        self._pending_uid = None
+        self.btn_cancel.disabled = True
+        self.btn_cancel.opacity = 0
+        self.btn_done.disabled = False
+        self.btn_done.opacity = 1
+        self.btn_cancel.text = 'Annuler (3)'
+
+    def _execute_done(self):
+        success = mark_as_done(self._pending_uid)
+        if success:
+            global PAR_TAG
+            PAR_TAG = fetch_tasks()
+            self.manager.get_screen('tags').build_ui()
+            self.manager.transition.direction = 'right'
+            self.manager.get_screen('tasks').load_tag(CURRENT_TAG)
+            self.manager.current = 'tasks'
+
+class gtgDroidApp(App):
+    title = 'gtgDroid'
+
+    def build(self):
+        sm = ScreenManager(transition=SlideTransition())
+        sm.add_widget(LoadingScreen(name='loading'))
+        sm.add_widget(TagsScreen(name='tags'))
+        sm.add_widget(TasksScreen(name='tasks'))
+        sm.add_widget(DetailScreen(name='detail'))
+        sm.add_widget(NewTaskScreen(name='new'))
+        return sm
+
+if __name__ == '__main__':
+    gtgDroidApp().run()
+========== ./main.py ==========
+from kivy.app import App
+from kivy.uix.screenmanager import ScreenManager, SlideTransition
+from kivy.core.window import Window
+
+from screens.loading import LoadingScreen
+from screens.tags import TagsScreen
+from screens.tasks import TasksScreen
+from screens.detail import DetailScreen
+from screens.new_task import NewTaskScreen
+
+Window.clearcolor = (0.95, 0.95, 0.95, 1)
+
+class gtgDroidApp(App):
+    title = 'gtgDroid'
+
+    def build(self):
+        sm = ScreenManager(transition=SlideTransition())
+        sm.add_widget(LoadingScreen(name='loading'))
+        sm.add_widget(TagsScreen(name='tags'))
+        sm.add_widget(TasksScreen(name='tasks'))
+        sm.add_widget(DetailScreen(name='detail'))
+        sm.add_widget(NewTaskScreen(name='new'))
+        return sm
+
+if __name__ == '__main__':
+    gtgDroidApp().run()
+========== ./models.py ==========
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Task:
+    """Modèle de données d'une tâche gtgDroid.
+
+    Remplace le tuple (title, status, due_str, start_str, description,
+    task_uid, priority, has_children) utilisé en Phase 1.
+
+    Accès par attribut au lieu d'index — lisible, extensible, sans risque
+    de casser le code existant quand on ajoute un champ.
+    """
+    title: str
+    status: str                  # 'NEEDS-ACTION', 'COMPLETED', 'CANCELLED'
+    due_str: str                 # 'JJ/MM/AAAA' ou ''
+    start_str: str               # 'JJ/MM/AAAA' ou ''
+    description: str             # Notes libres
+    task_uid: str                # UUID CalDAV
+    priority: int                # 0=Maintenant, 5=Bientôt, 9=Un jour
+    has_children: bool           # True si la tâche a des sous-tâches
+    fuzzy: str = ''              # 'soon', 'someday', '' — X-GTG-FUZZY CalDAV
+    tags: str = ''               # 'IT, urgent' — copie locale pour accès rapide
+
+    def is_completed(self) -> bool:
+        return self.status == 'COMPLETED'
+
+    def is_cancelled(self) -> bool:
+        return self.status == 'CANCELLED'
+
+    def is_open(self) -> bool:
+        return self.status == 'NEEDS-ACTION'
+
+    def priority_label(self) -> str:
+        if self.priority == 5 or self.fuzzy == 'soon':
+            return 'Bientôt'
+        if self.priority == 9 or self.fuzzy == 'someday':
+            return 'Un jour'
+        return ''
+
+    def priority_color(self):
+        label = self.priority_label()
+        if label == 'Bientôt':
+            return (0.5, 0.4, 0.8, 1)
+        if label == 'Un jour':
+            return (0.5, 0.5, 0.5, 1)
+        return (0.3, 0.3, 0.3, 1)
+
+========== ./screens/action.py ==========
+from kivy.uix.screenmanager import Screen
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.graphics import Color, Rectangle
+from datetime import date
+import state
+
+# ── Couleurs GTG ──────────────────────────────────────────────────────────────
+ROUGE  = (0.95, 0.35, 0.35, 1)   # Échéance dépassée ou aujourd'hui
+JAUNE  = (0.98, 0.85, 0.25, 1)   # Échéance dans les 15 prochains jours
+BLANC  = (1,    1,    1,    1)    # Pas de date ou date lointaine
+GRIS   = (0.88, 0.88, 0.88, 1)   # Tâche parente (a des enfants ouverts)
+
+ROUGE_TXT = (0.7, 0.1, 0.1, 1)
+JAUNE_TXT = (0.5, 0.4, 0.0, 1)
+NOIR_TXT  = (0.15, 0.15, 0.15, 1)
+GRIS_TXT  = (0.4,  0.4,  0.4,  1)
+
+
+def _parse_date(date_str):
+    """Convertit 'JJ/MM/AAAA' en date Python, None si vide ou invalide."""
+    if not date_str:
+        return None
+    try:
+        return date(int(date_str[6:10]), int(date_str[3:5]), int(date_str[0:2]))
+    except Exception:
+        return None
+
+
+def _task_color(task):
+    """Retourne (bg_color, txt_color) selon l'échéance — style GTG."""
+    due = _parse_date(task.due_str)
+    today = date.today()
+    if task.has_children:
+        return GRIS, GRIS_TXT
+    if due is None:
+        return BLANC, NOIR_TXT
+    delta = (due - today).days
+    if delta <= 0:
+        return ROUGE, ROUGE_TXT
+    if delta <= 15:
+        return JAUNE, JAUNE_TXT
+    return BLANC, NOIR_TXT
+
+
+def _is_actionable(task):
+    """Filtre GTG : exclut 'Un jour' et DTSTART dans le futur."""
+    if task.priority == 9 or task.fuzzy == 'someday':
+        return False
+    start = _parse_date(task.start_str)
+    if start and start > date.today():
+        return False
+    return True
+
+
+def _get_actionable_tasks(tag_filter=None):
+    """
+    Retourne la liste plate de toutes les tâches actionnables,
+    triées : d'abord les terminales (sans enfants) par échéance,
+    puis les parentes (avec enfants ouverts) en dessous.
+    Filtre optionnel par tag.
+    """
+    seen = set()
+    terminales = []
+    parentes = []
+
+    source = state.PAR_TAG
+    tags_a_parcourir = [tag_filter] if tag_filter else list(source.keys())
+
+    for tag in tags_a_parcourir:
+        for task in source.get(tag, []):
+            if task.task_uid in seen:
+                continue
+            seen.add(task.task_uid)
+            if not _is_actionable(task):
+                continue
+            if task.has_children:
+                parentes.append(task)
+            else:
+                terminales.append(task)
+
+    def sort_key(t):
+        due = _parse_date(t.due_str)
+        if due is None:
+            return (1, date(9999, 12, 31), t.title)
+        return (0, due, t.title)
+
+    terminales.sort(key=sort_key)
+    parentes.sort(key=sort_key)
+    return terminales + parentes
+
+
+class ActionScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._tag_filter = None
+
+    def load_view(self, tag_filter=None):
+        """Point d'entrée — construit l'écran avec filtre tag optionnel."""
+        self._tag_filter = tag_filter
+        self.build_ui()
+
+    def build_ui(self):
+        self.clear_widgets()
+        root = BoxLayout(orientation='vertical')
+
+        # ── HEADER ────────────────────────────────────────────────────────────
+        header = BoxLayout(size_hint_y=None, height=55, padding=[5, 5])
+        btn_back = Button(
+            text='←',
+            size_hint_x=None, width=50,
+            background_color=(0.5, 0.5, 0.5, 1),
+            color=(1, 1, 1, 1),
+            font_size=20
+        )
+        btn_back.bind(on_press=self.go_back)
+        header.add_widget(btn_back)
+
+        titre = '⚡ Actionnables'
+        if self._tag_filter:
+            titre += f'  #{self._tag_filter}'
+        header.add_widget(Label(
+            text=titre,
+            bold=True, font_size=18,
+            color=(0.2, 0.5, 0.9, 1)
+        ))
+
+        btn_refresh = Button(
+            text='↺',
+            size_hint_x=None, width=50,
+            background_color=(0.2, 0.5, 0.9, 1),
+            color=(1, 1, 1, 1),
+            font_size=18
+        )
+        btn_refresh.bind(on_press=lambda x: self.build_ui())
+        header.add_widget(btn_refresh)
+        root.add_widget(header)
+
+        # ── FILTRES TAGS ──────────────────────────────────────────────────────
+        # Bouton "Tous" + un bouton par tag existant dans les actionnables
+        tags_presents = sorted(set(
+            tag for tag in state.PAR_TAG.keys()
+            if any(_is_actionable(t) for t in state.PAR_TAG[tag])
+        ))
+
+        if tags_presents:
+            filter_scroll = ScrollView(
+                size_hint_y=None, height=45,
+                do_scroll_y=False, do_scroll_x=True
+            )
+            filter_bar = BoxLayout(
+                size_hint_x=None, height=45, spacing=4, padding=[5, 3]
+            )
+            filter_bar.bind(minimum_width=filter_bar.setter('width'))
+
+            def make_filter_btn(label, tag_val):
+                is_active = self._tag_filter == tag_val
+                btn = Button(
+                    text=label,
+                    size_hint_x=None,
+                    width=max(80, len(label) * 10 + 20),
+                    height=39,
+                    background_color=(0.2, 0.5, 0.9, 1) if is_active else (0.8, 0.8, 0.8, 1),
+                    color=(1, 1, 1, 1) if is_active else (0.2, 0.2, 0.2, 1),
+                    font_size=13,
+                    bold=is_active
+                )
+                def on_press(x, v=tag_val):
+                    self._tag_filter = v
+                    self.build_ui()
+                btn.bind(on_press=on_press)
+                return btn
+
+            filter_bar.add_widget(make_filter_btn('Tous', None))
+            for tag in tags_presents:
+                filter_bar.add_widget(make_filter_btn(f'#{tag}', tag))
+
+            filter_scroll.add_widget(filter_bar)
+            root.add_widget(filter_scroll)
+
+        # ── LISTE DES TÂCHES ──────────────────────────────────────────────────
+        taches = _get_actionable_tasks(self._tag_filter)
+
+        scroll = ScrollView()
+        layout = GridLayout(cols=1, spacing=2, size_hint_y=None, padding=[5, 5])
+        layout.bind(minimum_height=layout.setter('height'))
+
+        if not taches:
+            layout.add_widget(Label(
+                text='Aucune tâche actionnable.',
+                size_hint_y=None, height=60,
+                color=(0.5, 0.5, 0.5, 1),
+                font_size=15
+            ))
+        else:
+            for task in taches:
+                self._add_task_row(layout, task)
+
+        scroll.add_widget(layout)
+        root.add_widget(scroll)
+
+        # ── LÉGENDE ───────────────────────────────────────────────────────────
+        legende = BoxLayout(size_hint_y=None, height=30, padding=[10, 2], spacing=15)
+        for couleur, texte in [
+            (ROUGE, '■ En retard'),
+            (JAUNE, '■ Bientôt'),
+            (BLANC, '■ OK'),
+            (GRIS,  '■ Parent'),
+        ]:
+            lbl = Label(
+                text=texte, font_size=11,
+                color=(couleur[0]*0.6, couleur[1]*0.6, couleur[2]*0.6, 1)
+                if couleur != BLANC else (0.5, 0.5, 0.5, 1)
+            )
+            legende.add_widget(lbl)
+        root.add_widget(legende)
+
+        self.add_widget(root)
+
+    def _add_task_row(self, layout, task):
+        bg_color, txt_color = _task_color(task)
+        due = _parse_date(task.due_str)
+        today = date.today()
+
+        # Ligne principale
+        row = BoxLayout(size_hint_y=None, height=52, padding=[8, 4])
+
+        with row.canvas.before:
+            Color(*bg_color)
+            row._rect = Rectangle(pos=row.pos, size=row.size)
+        row.bind(pos=lambda w, v: setattr(w._rect, 'pos', v))
+        row.bind(size=lambda w, v: setattr(w._rect, 'size', v))
+
+        # Icône parente ou terminale
+        icone = '▶ ' if task.has_children else '○ '
+
+        # Texte échéance
+        if due:
+            delta = (due - today).days
+            if delta < 0:
+                due_txt = f'{abs(delta)}j de retard'
+            elif delta == 0:
+                due_txt = "Aujourd'hui"
+            elif delta <= 15:
+                due_txt = f'dans {delta}j'
+            else:
+                due_txt = task.due_str
+        else:
+            due_txt = ''
+
+        # Titre + tags
+        tags_str = task.tags
+        tags_autres = [t.strip() for t in tags_str.split(',')
+                       if t.strip() and t.strip() != self._tag_filter] if tags_str else []
+        tags_display = '  '.join(f'@{t}' for t in tags_autres) if tags_autres else ''
+
+        titre_complet = f'{icone}{task.title}'
+        if tags_display:
+            titre_complet += f'\n  {tags_display}'
+
+        btn = Button(
+            text=titre_complet,
+            halign='left', valign='middle',
+            text_size=(None, None),
+            color=txt_color,
+            background_color=(0, 0, 0, 0),
+            font_size=15 if not task.has_children else 14,
+            bold=not task.has_children
+        )
+        btn.bind(size=lambda w, v: setattr(w, 'text_size', (v[0] - 10, None)))
+        btn.task_data = task
+        btn.bind(on_press=self.go_to_detail)
+        row.add_widget(btn)
+
+        if due_txt:
+            lbl_due = Label(
+                text=due_txt,
+                size_hint_x=None, width=90,
+                color=txt_color,
+                font_size=12,
+                halign='right', valign='middle'
+            )
+            lbl_due.bind(size=lambda w, v: setattr(w, 'text_size', v))
+            row.add_widget(lbl_due)
+
+        layout.add_widget(row)
+
+    def go_to_detail(self, btn):
+        task_data = btn.task_data
+        state.CURRENT_TAG = task_data.tags.split(',')[0].strip() if task_data.tags else 'Sans tag'
+        self.manager.transition.direction = 'left'
+        detail = self.manager.get_screen('detail')
+        detail.load_task(task_data)
+        self.manager.current = 'detail'
+
+    def go_back(self, *args):
+        self.manager.transition.direction = 'right'
+        self.manager.current = 'tags'
+
+========== ./screens/detail.py ==========
+from kivy.uix.screenmanager import Screen
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.clock import Clock
+import state
+from widgets import confirm_popup, loading_popup
+
+
+class DetailScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.root = BoxLayout(orientation='vertical')
+        self.add_widget(self.root)
+        self._cancel_event = None
+        self._pending_uid = None
+        self._from_parent_data = None
+
+    def load_task(self, task_data, from_parent_data=None):
+        self.root.clear_widgets()
+        self.task_data = task_data
+        self._from_parent_data = from_parent_data
+
+        title_task = task_data.title
+        status = task_data.status
+        due_str = task_data.due_str
+        start_str = task_data.start_str
+        description = task_data.description
+        task_uid = task_data.task_uid
+        priority = task_data.priority
+        has_children = task_data.has_children
+
+        # ── HEADER ────────────────────────────────────────────────
+        header = BoxLayout(size_hint_y=None, height=55, padding=[5, 5])
+
+        btn_back = Button(
+            text='< Retour',
+            size_hint_x=0.25,
+            background_color=(0.2, 0.5, 0.9, 1),
+            color=(1, 1, 1, 1),
+            font_size=14
+        )
+        def go_back(x):
+            if self._cancel_event:
+                self._cancel_event.cancel()
+                self._cancel_event = None
+                self._pending_uid = None
+            self.manager.transition.direction = 'right'
+            if self._from_parent_data is not None:
+                self.load_task(self._from_parent_data)
+            else:
+                self.manager.current = 'tasks'
+        btn_back.bind(on_press=go_back)
+
+        btn_edit = Button(
+            text='Modifier',
+            size_hint_x=0.25,
+            background_color=(0.5, 0.5, 0.5, 1),
+            color=(1, 1, 1, 1),
+            font_size=14
+        )
+        def go_edit(x):
+            self.manager.transition.direction = 'left'
+            self.manager.get_screen('new').load_form(edit_data=self.task_data)
+            self.manager.current = 'new'
+        btn_edit.bind(on_press=go_edit)
+
+        btn_delete = Button(
+            text='Supprimer',
+            size_hint_x=0.25,
+            background_color=(0.8, 0.2, 0.2, 1),
+            color=(1, 1, 1, 1),
+            font_size=14
+        )
+        def ask_delete(x):
+            confirm_popup(
+                f"Supprimer définitivement ?\n\n{title_task}",
+                lambda: self.do_delete(task_uid)
+            )
+        btn_delete.bind(on_press=ask_delete)
+
+        header.add_widget(btn_back)
+        header.add_widget(Label(
+            text='Détail',
+            bold=True, font_size=16,
+            color=(0.2, 0.5, 0.9, 1)
+        ))
+        header.add_widget(btn_edit)
+        header.add_widget(btn_delete)
+        self.root.add_widget(header)
+
+        # ── CORPS SCROLLABLE ──────────────────────────────────────
+        scroll = ScrollView()
+        layout = GridLayout(cols=1, spacing=10, size_hint_y=None, padding=[15, 10])
+        layout.bind(minimum_height=layout.setter('height'))
+
+        # Titre avec indice visuel
+        titre_affiche = f"▶  {title_task}" if has_children else title_task
+        layout.add_widget(Label(
+            text=titre_affiche,
+            bold=True, font_size=20,
+            size_hint_y=None, height=60,
+            halign='left', valign='middle',
+            text_size=(750, 60),
+            color=(0.2, 0.5, 0.9, 1) if has_children else (0.1, 0.1, 0.1, 1)
+        ))
+
+        # Tags — lecture depuis le cache, zéro appel réseau
+        tags_str = state.TAGS_PAR_UID.get(task_uid, '')
+        if tags_str:
+            tags_list = [t.strip() for t in tags_str.split(',') if t.strip()]
+            tags_affiche = '  '.join([f"@{t}" for t in tags_list])
+            layout.add_widget(Label(
+                text=f"  {tags_affiche}",
+                size_hint_y=None, height=32,
+                halign='left', valign='middle',
+                text_size=(750, 32),
+                color=(0.8, 0.6, 0.0, 1),
+                font_size=14,
+                bold=True
+            ))
+
+        # Statut
+        icone = '✓' if status == 'COMPLETED' else '○'
+        layout.add_widget(Label(
+            text=f"Statut : {icone}  {status}",
+            size_hint_y=None, height=40,
+            halign='left', valign='middle',
+            text_size=(750, 40),
+            color=(0.3, 0.3, 0.3, 1),
+            font_size=15
+        ))
+
+        # Priorité fuzzy
+        if priority == 5:
+            priorite_str = 'Bientôt'
+            priorite_color = (0.5, 0.4, 0.8, 1)
+        elif priority == 9:
+            priorite_str = 'Un jour'
+            priorite_color = (0.5, 0.5, 0.5, 1)
+        else:
+            priorite_str = None
+
+        if priorite_str:
+            layout.add_widget(Label(
+                text=f"Priorité : {priorite_str}",
+                size_hint_y=None, height=40,
+                halign='left', valign='middle',
+                text_size=(750, 40),
+                color=priorite_color,
+                font_size=15
+            ))
+
+        # Date de début
+        if start_str:
+            layout.add_widget(Label(
+                text=f"Commence le : {start_str}",
+                size_hint_y=None, height=40,
+                halign='left', valign='middle',
+                text_size=(750, 40),
+                color=(0.5, 0.3, 0.8, 1),
+                font_size=15
+            ))
+
+        # Échéance
+        if due_str:
+            layout.add_widget(Label(
+                text=f"Échéance : {due_str}",
+                size_hint_y=None, height=40,
+                halign='left', valign='middle',
+                text_size=(750, 40),
+                color=(0.2, 0.5, 0.9, 1),
+                font_size=15
+            ))
+
+        # Notes
+        if description and description != 'None':
+            layout.add_widget(Label(
+                text=f"Notes :\n{description}",
+                size_hint_y=None, height=200,
+                halign='left', valign='top',
+                text_size=(750, 200),
+                color=(0.3, 0.3, 0.3, 1),
+                font_size=14
+            ))
+
+        # ── BOUTON AJOUTER SOUS-TÂCHE ─────────────────────────────
+        btn_add_sub = Button(
+            text='+ Ajouter une sous-tâche',
+            size_hint_y=None, height=45,
+            background_color=(0.3, 0.6, 0.9, 1),
+            color=(1, 1, 1, 1),
+            font_size=14
+        )
+        def go_add_subtask(x):
+            self.manager.transition.direction = 'left'
+            self.manager.get_screen('new').load_form(parent_uid=task_uid)
+            self.manager.current = 'new'
+        btn_add_sub.bind(on_press=go_add_subtask)
+        layout.add_widget(btn_add_sub)
+
+        # ── SECTION SOUS-TÂCHES — depuis le cache ─────────────────
+        if has_children:
+            layout.add_widget(Label(
+                text='── Sous-tâches ──────────────────────',
+                size_hint_y=None, height=35,
+                halign='left', valign='middle',
+                text_size=(750, 35),
+                color=(0.4, 0.4, 0.4, 1),
+                font_size=13
+            ))
+
+            self.subtasks_layout = GridLayout(
+                cols=1, spacing=2, size_hint_y=None
+            )
+            self.subtasks_layout.bind(minimum_height=self.subtasks_layout.setter('height'))
+            layout.add_widget(self.subtasks_layout)
+
+            layout.add_widget(Label(
+                text='─────────────────────────────────────',
+                size_hint_y=None, height=20,
+                halign='left', valign='middle',
+                text_size=(750, 20),
+                color=(0.4, 0.4, 0.4, 1),
+                font_size=13
+            ))
+
+            # Charger depuis le cache — instantané
+            self._load_subtasks(task_uid)
+
+        # ── BOUTONS D'ACTION ──────────────────────────────────────
+        if status != 'COMPLETED':
+
+            self.btn_done = Button(
+                text='✓  Marquer comme faite',
+                size_hint_y=None, height=55,
+                background_color=(0.2, 0.7, 0.3, 1),
+                color=(1, 1, 1, 1),
+                font_size=16,
+                bold=True
+            )
+            self.btn_done.task_uid = task_uid
+            self.btn_done.task_title = title_task
+            def ask_confirm(btn):
+                confirm_popup(
+                    f"Marquer comme faite ?\n\n{btn.task_title}",
+                    lambda: self.start_countdown(btn.task_uid)
+                )
+            self.btn_done.bind(on_press=ask_confirm)
+            layout.add_widget(self.btn_done)
+
+            self.btn_cancel = Button(
+                text='Annuler (3)',
+                size_hint_y=None, height=55,
+                background_color=(0.8, 0.4, 0.1, 1),
+                color=(1, 1, 1, 1),
+                font_size=16,
+                bold=True,
+                opacity=0,
+                disabled=True
+            )
+            self.btn_cancel.bind(on_press=self.cancel_done)
+            layout.add_widget(self.btn_cancel)
+
+            btn_reset = Button(
+                text='↺  Réinitialiser → "Un jour"',
+                size_hint_y=None, height=55,
+                background_color=(0.4, 0.5, 0.7, 1),
+                color=(1, 1, 1, 1),
+                font_size=16,
+                bold=True
+            )
+            def ask_reset(x):
+                msg = f"Archiver et recréer cette tâche ?\n\n{title_task}\n\nLes sous-tâches cochées seront\narchivées et recréées à zéro." if has_children else f"Archiver et recréer cette tâche ?\n\n{title_task}"
+                confirm_popup(msg, lambda: self.do_reset(task_uid))
+            btn_reset.bind(on_press=ask_reset)
+            layout.add_widget(btn_reset)
+
+            btn_dismiss = Button(
+                text='✕  Abandonner',
+                size_hint_y=None, height=55,
+                background_color=(0.5, 0.5, 0.5, 1),
+                color=(1, 1, 1, 1),
+                font_size=16,
+                bold=True
+            )
+            def ask_dismiss(x):
+                confirm_popup(
+                    f"Abandonner cette tâche ?\n\n{title_task}\n\nElle sera conservée dans l'historique\nmais ne comptera pas comme faite.",
+                    lambda: self.do_dismiss(task_uid)
+                )
+            btn_dismiss.bind(on_press=ask_dismiss)
+            layout.add_widget(btn_dismiss)
+
+        scroll.add_widget(layout)
+        self.root.add_widget(scroll)
+
+    def _load_subtasks(self, parent_uid):
+        """Charge les sous-tâches depuis le cache state — instantané."""
+        from caldav_api import fetch_subtasks
+        subtasks = fetch_subtasks(parent_uid)
+        self.subtasks_layout.clear_widgets()
+
+        if not subtasks:
+            self.subtasks_layout.add_widget(Label(
+                text='  Aucune sous-tâche.',
+                size_hint_y=None, height=40,
+                halign='left', valign='middle',
+                text_size=(750, 40),
+                color=(0.6, 0.6, 0.6, 1),
+                font_size=14
+            ))
+            return
+
+        for sub_data in subtasks:
+            self._add_subtask_row(sub_data)
+
+    def _add_subtask_row(self, sub_data):
+        """Ajoute une ligne de sous-tâche avec case à cocher et bouton détail."""
+        sub_title = sub_data.title
+        sub_status = sub_data.status
+        sub_uid = sub_data.task_uid
+        sub_has_children = sub_data.has_children
+
+        row = BoxLayout(size_hint_y=None, height=50, spacing=5)
+
+        is_done = sub_status == 'COMPLETED'
+        btn_check = Button(
+            text='✓' if is_done else '○',
+            size_hint_x=None, width=50,
+            background_color=(0.2, 0.7, 0.3, 1) if is_done else (0.85, 0.85, 0.85, 1),
+            color=(1, 1, 1, 1) if is_done else (0.3, 0.3, 0.3, 1),
+            font_size=18,
+            bold=True,
+            disabled=is_done
+        )
+        if not is_done:
+            btn_check.sub_uid = sub_uid
+            btn_check.sub_title = sub_title
+            btn_check.bind(on_press=self._toggle_subtask)
+
+        titre_affiche = f"▶ {sub_title}" if sub_has_children else sub_title
+        couleur_titre = (0.5, 0.5, 0.5, 1) if is_done else (0.1, 0.1, 0.1, 1)
+
+        lbl_title = Label(
+            text=titre_affiche,
+            halign='left', valign='middle',
+            text_size=(600, 50),
+            color=couleur_titre,
+            font_size=15
+        )
+
+        btn_detail = Button(
+            text='>',
+            size_hint_x=None, width=45,
+            background_color=(0.7, 0.7, 0.7, 1),
+            color=(1, 1, 1, 1),
+            font_size=16,
+            bold=True
+        )
+        btn_detail.sub_data = sub_data
+        btn_detail.bind(on_press=self._go_to_subtask_detail)
+
+        row.add_widget(btn_check)
+        row.add_widget(lbl_title)
+        row.add_widget(btn_detail)
+        self.subtasks_layout.add_widget(row)
+
+    def _toggle_subtask(self, btn):
+        confirm_popup(
+            f"Marquer comme faite ?\n\n{btn.sub_title}",
+            lambda: self._do_check_subtask(btn.sub_uid)
+        )
+
+    def _do_check_subtask(self, sub_uid):
+        popup = loading_popup()
+        def _execute(dt):
+            from caldav_api import mark_as_done, fetch_tasks
+            mark_as_done(sub_uid)
+            fetch_tasks()  # Rafraîchit le cache complet
+            popup.dismiss()
+            self._load_subtasks(self.task_data.task_uid)
+        Clock.schedule_once(_execute, 0.1)
+
+    def _go_to_subtask_detail(self, btn):
+        """Navigue vers le détail d'une sous-tâche — mémorise le parent pour le retour."""
+        self.manager.transition.direction = 'left'
+        self.load_task(btn.sub_data, from_parent_data=self.task_data)
+        self.manager.current = 'detail'
+
+    def do_dismiss(self, task_uid):
+        """Abandonne une tâche — STATUS:CANCELLED, hors stats, dans l'historique."""
+        popup = loading_popup()
+        def _execute(dt):
+            from caldav_api import dismiss_task, fetch_tasks
+            dismiss_task(task_uid)
+            fetch_tasks()
+            popup.dismiss()
+            self.manager.get_screen('tags').build_ui()
+            self.manager.transition.direction = 'right'
+            self.manager.get_screen('tasks').load_tag(state.CURRENT_TAG)
+            self.manager.current = 'tasks'
+        Clock.schedule_once(_execute, 0.1)
+
+    def do_delete(self, task_uid):
+        popup = loading_popup()
+        def _delete(dt):
+            from caldav_api import delete_task, fetch_tasks
+            delete_task(task_uid)
+            fetch_tasks()
+            popup.dismiss()
+            self.manager.get_screen('tags').build_ui()
+            self.manager.transition.direction = 'right'
+            self.manager.get_screen('tasks').load_tag(state.CURRENT_TAG)
+            self.manager.current = 'tasks'
+        Clock.schedule_once(_delete, 0.1)
+
+    def do_reset(self, task_uid):
+        popup = loading_popup()
+        def _execute(dt):
+            from caldav_api import reset_and_clone_task, fetch_tasks
+            reset_and_clone_task(task_uid)
+            fetch_tasks()
+            popup.dismiss()
+            self.manager.get_screen('tags').build_ui()
+            self.manager.transition.direction = 'right'
+            self.manager.get_screen('tasks').load_tag(state.CURRENT_TAG)
+            self.manager.current = 'tasks'
+        Clock.schedule_once(_execute, 0.1)
+
+    def start_countdown(self, task_uid):
+        self._pending_uid = task_uid
+        self._countdown = 3
+        self.btn_done.disabled = True
+        self.btn_done.opacity = 0
+        self.btn_cancel.disabled = False
+        self.btn_cancel.opacity = 1
+        self.btn_cancel.text = f'Annuler ({self._countdown})'
+        self._cancel_event = Clock.schedule_interval(self._tick, 1)
+
+    def _tick(self, dt):
+        self._countdown -= 1
+        if self._countdown > 0:
+            self.btn_cancel.text = f'Annuler ({self._countdown})'
+        else:
+            self._cancel_event.cancel()
+            self._cancel_event = None
+            self._execute_done()
+
+    def cancel_done(self, *args):
+        if self._cancel_event:
+            self._cancel_event.cancel()
+            self._cancel_event = None
+        self._pending_uid = None
+        self.btn_cancel.disabled = True
+        self.btn_cancel.opacity = 0
+        self.btn_done.disabled = False
+        self.btn_done.opacity = 1
+        self.btn_cancel.text = 'Annuler (3)'
+
+    def _execute_done(self):
+        from caldav_api import mark_as_done, fetch_tasks
+        success = mark_as_done(self._pending_uid)
+        if success:
+            fetch_tasks()
+            self.manager.get_screen('tags').build_ui()
+            self.manager.transition.direction = 'right'
+            self.manager.get_screen('tasks').load_tag(state.CURRENT_TAG)
+            self.manager.current = 'tasks'
+========== ./screens/__init__.py ==========
+
+========== ./screens/loading.py ==========
+from kivy.uix.screenmanager import Screen
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.label import Label
+from kivy.clock import Clock
+import state
+
+class LoadingScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        layout = BoxLayout(orientation='vertical')
+        layout.add_widget(Label(
+            text='gtgDroid',
+            bold=True, font_size=28,
+            color=(0.2, 0.5, 0.9, 1)
+        ))
+        self.status = Label(
+            text='Connexion a Nextcloud...',
+            font_size=15,
+            color=(0.4, 0.4, 0.4, 1)
+        )
+        layout.add_widget(self.status)
+        self.add_widget(layout)
+
+    def on_enter(self):
+        Clock.schedule_once(self.load_data, 0.3)
+
+    def load_data(self, dt):
+        self.status.text = 'Chargement des taches...'
+        Clock.schedule_once(self._do_fetch, 0.1)
+
+    def _do_fetch(self, dt):
+        from caldav_api import fetch_tasks
+        state.PAR_TAG = fetch_tasks()
+        self.manager.get_screen('tags').build_ui()
+        self.manager.transition.direction = 'left'
+        self.manager.current = 'tags'
+        
+    def _do_fetch(self, dt):
+        from caldav_api import fetch_tasks, fetch_tasks_completed
+        state.PAR_TAG = fetch_tasks()
+        state.PAR_TAG_CLOSED = fetch_tasks_completed()
+        self.manager.get_screen('tags').build_ui()
+        self.manager.transition.direction = 'left'
+        self.manager.current = 'tags'
+========== ./screens/new_task.py ==========
+from kivy.uix.screenmanager import Screen
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.uix.textinput import TextInput
+from kivy.clock import Clock
+from datetime import date
+import state
+from widgets import loading_popup
+
+PRIORITY_BIENTOT = 5
+PRIORITY_UN_JOUR = 9
+
+
+def today_str():
+    return date.today().strftime('%d/%m/%Y')
+
+
+class NewTaskScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.root = BoxLayout(orientation='vertical')
+        self.add_widget(self.root)
+        self.edit_uid = None
+        self.parent_uid = None  # Si défini : on crée une sous-tâche
+
+    def load_form(self, default_tag='', edit_data=None, parent_uid=None):
+        self.root.clear_widgets()
+        # Toujours réinitialiser l'état avant de construire le formulaire
+        self.edit_uid = None
+        self.parent_uid = None
+        self.edit_uid = edit_data.task_uid if edit_data else None
+        self.parent_uid = parent_uid
+
+        # Titre du formulaire selon le contexte
+        if edit_data:
+            form_title = 'Modifier'
+        elif parent_uid:
+            form_title = 'Nouvelle sous-tâche'
+        else:
+            form_title = 'Nouvelle tâche'
+
+        # ── HEADER ────────────────────────────────────────────────
+        header = BoxLayout(size_hint_y=None, height=55, padding=[5, 5])
+        btn_back = Button(
+            text='< Retour',
+            size_hint_x=0.3,
+            background_color=(0.2, 0.5, 0.9, 1),
+            color=(1, 1, 1, 1),
+            font_size=14
+        )
+        def go_back(x):
+            self.manager.transition.direction = 'right'
+            if self.edit_uid or self.parent_uid:
+                self.manager.current = 'detail'
+            else:
+                self.manager.current = 'tags'
+        btn_back.bind(on_press=go_back)
+        header.add_widget(btn_back)
+        header.add_widget(Label(
+            text=form_title,
+            bold=True, font_size=18,
+            color=(0.2, 0.5, 0.9, 1)
+        ))
+        self.root.add_widget(header)
+
+        # ── FORMULAIRE ────────────────────────────────────────────
+        layout = GridLayout(cols=1, spacing=12, size_hint_y=None, padding=[15, 10])
+        layout.bind(minimum_height=layout.setter('height'))
+
+        # Titre
+        layout.add_widget(Label(
+            text='Titre',
+            size_hint_y=None, height=30,
+            halign='left', valign='middle',
+            text_size=(750, 30),
+            color=(0.3, 0.3, 0.3, 1),
+            bold=True
+        ))
+        self.input_title = TextInput(
+            hint_text='Titre de la tâche...',
+            text=edit_data.title if edit_data else '',
+            size_hint_y=None, height=50,
+            multiline=False,
+            font_size=15
+        )
+        layout.add_widget(self.input_title)
+
+        # Tag — masqué si sous-tâche (hérite du parent automatiquement)
+        if not parent_uid:
+            layout.add_widget(Label(
+                text='Tag (optionnel)',
+                size_hint_y=None, height=30,
+                halign='left', valign='middle',
+                text_size=(750, 30),
+                color=(0.3, 0.3, 0.3, 1),
+                bold=True
+            ))
+            current_tag = ''
+            if edit_data:
+                # Récupérer TOUS les tags de la tâche depuis CalDAV
+                from caldav_api import fetch_tags_for_uid
+                current_tag = fetch_tags_for_uid(edit_data.task_uid)
+            self.input_tag = TextInput(
+                hint_text='ex: TVX, IT, Home (virgule pour séparer)',
+                text=current_tag or default_tag,
+                size_hint_y=None, height=50,
+                multiline=False,
+                font_size=15
+            )
+            layout.add_widget(self.input_tag)
+        else:
+            self.input_tag = None  # Pas de tag pour les sous-tâches
+
+        # Commence le
+        layout.add_widget(Label(
+            text='Commence le (optionnel)',
+            size_hint_y=None, height=30,
+            halign='left', valign='middle',
+            text_size=(750, 30),
+            color=(0.3, 0.3, 0.3, 1),
+            bold=True
+        ))
+        self.input_start = TextInput(
+            hint_text='JJ/MM/AAAA',
+            text=edit_data.start_str if edit_data else '',
+            size_hint_y=None, height=50,
+            multiline=False,
+            font_size=15
+        )
+        layout.add_widget(self.input_start)
+        btn_start_today = Button(
+            text="Aujourd'hui",
+            size_hint_y=None, height=45,
+            background_color=(0.3, 0.6, 0.9, 1),
+            color=(1, 1, 1, 1),
+            font_size=14
+        )
+        def set_start_today(x):
+            self.input_start.text = today_str()
+        btn_start_today.bind(on_press=set_start_today)
+        layout.add_widget(btn_start_today)
+
+        # Échéance
+        layout.add_widget(Label(
+            text='Échéance (optionnel)',
+            size_hint_y=None, height=30,
+            halign='left', valign='middle',
+            text_size=(750, 30),
+            color=(0.3, 0.3, 0.3, 1),
+            bold=True
+        ))
+        self.input_due = TextInput(
+            hint_text='JJ/MM/AAAA',
+            text=edit_data.due_str if edit_data else '',
+            size_hint_y=None, height=50,
+            multiline=False,
+            font_size=15
+        )
+        layout.add_widget(self.input_due)
+        btn_due_today = Button(
+            text="Aujourd'hui",
+            size_hint_y=None, height=45,
+            background_color=(0.3, 0.6, 0.9, 1),
+            color=(1, 1, 1, 1),
+            font_size=14
+        )
+        def set_due_today(x):
+            self.input_due.text = today_str()
+        btn_due_today.bind(on_press=set_due_today)
+        layout.add_widget(btn_due_today)
+
+        # Priorité fuzzy — masquée pour les sous-tâches (moins pertinent)
+        if not parent_uid:
+            layout.add_widget(Label(
+                text='Quand ? (optionnel)',
+                size_hint_y=None, height=30,
+                halign='left', valign='middle',
+                text_size=(750, 30),
+                color=(0.3, 0.3, 0.3, 1),
+                bold=True
+            ))
+        current_priority = edit_data.priority if edit_data else 0
+        self._priority = current_priority
+        if not parent_uid:
+            btns_priority = BoxLayout(size_hint_y=None, height=50, spacing=5)
+            self.btn_bientot = Button(
+                text='Bientôt',
+                background_color=(0.5, 0.4, 0.8, 1) if current_priority == PRIORITY_BIENTOT else (0.8, 0.8, 0.8, 1),
+                color=(1, 1, 1, 1),
+                font_size=14
+            )
+            self.btn_un_jour = Button(
+                text='Un jour',
+                background_color=(0.4, 0.4, 0.4, 1) if current_priority == PRIORITY_UN_JOUR else (0.8, 0.8, 0.8, 1),
+                color=(1, 1, 1, 1),
+                font_size=14
+            )
+            self.btn_maintenant = Button(
+                text='Maintenant',
+                background_color=(0.3, 0.7, 0.4, 1) if current_priority == 0 else (0.8, 0.8, 0.8, 1),
+                color=(1, 1, 1, 1),
+                font_size=14
+            )
+            def set_bientot(x):
+                self._priority = PRIORITY_BIENTOT
+                self.btn_bientot.background_color = (0.5, 0.4, 0.8, 1)
+                self.btn_un_jour.background_color = (0.8, 0.8, 0.8, 1)
+                self.btn_maintenant.background_color = (0.8, 0.8, 0.8, 1)
+            def set_un_jour(x):
+                self._priority = PRIORITY_UN_JOUR
+                self.btn_bientot.background_color = (0.8, 0.8, 0.8, 1)
+                self.btn_un_jour.background_color = (0.4, 0.4, 0.4, 1)
+                self.btn_maintenant.background_color = (0.8, 0.8, 0.8, 1)
+            def set_maintenant(x):
+                self._priority = 0
+                self.btn_bientot.background_color = (0.8, 0.8, 0.8, 1)
+                self.btn_un_jour.background_color = (0.8, 0.8, 0.8, 1)
+                self.btn_maintenant.background_color = (0.3, 0.7, 0.4, 1)
+            self.btn_bientot.bind(on_press=set_bientot)
+            self.btn_un_jour.bind(on_press=set_un_jour)
+            self.btn_maintenant.bind(on_press=set_maintenant)
+            btns_priority.add_widget(self.btn_bientot)
+            btns_priority.add_widget(self.btn_un_jour)
+            btns_priority.add_widget(self.btn_maintenant)
+            layout.add_widget(btns_priority)
+        else:
+            self._priority = 0  # Pas de priorité fuzzy pour les sous-tâches
+
+        # Notes
+        layout.add_widget(Label(
+            text='Notes (optionnel)',
+            size_hint_y=None, height=30,
+            halign='left', valign='middle',
+            text_size=(750, 30),
+            color=(0.3, 0.3, 0.3, 1),
+            bold=True
+        ))
+        desc = edit_data.description if edit_data and edit_data.description != 'None' else ''
+        self.input_desc = TextInput(
+            hint_text='Notes...',
+            text=desc,
+            size_hint_y=None, height=120,
+            multiline=True,
+            font_size=15
+        )
+        layout.add_widget(self.input_desc)
+
+        # Bouton Enregistrer
+        btn_save = Button(
+            text='Enregistrer' if edit_data else 'Créer',
+            size_hint_y=None, height=55,
+            background_color=(0.2, 0.7, 0.3, 1),
+            color=(1, 1, 1, 1),
+            font_size=16,
+            bold=True
+        )
+        btn_save.bind(on_press=self.save_task)
+        layout.add_widget(btn_save)
+
+        scroll = ScrollView()
+        scroll.add_widget(layout)
+        self.root.add_widget(scroll)
+
+    def save_task(self, btn):
+        title = self.input_title.text.strip()
+        if not title:
+            return
+
+        tags = self.input_tag.text.strip() if self.input_tag else ''
+        start = self.input_start.text.strip() or None
+        due = self.input_due.text.strip() or None
+        desc = self.input_desc.text.strip()
+        priority = self._priority
+
+        popup = loading_popup()
+
+        def do_save(dt):
+            from caldav_api import create_task, create_subtask, update_task, fetch_tasks
+            if self.edit_uid:
+                update_task(self.edit_uid, title, tags, start, due, desc, priority)
+            elif self.parent_uid:
+                create_subtask(self.parent_uid, title, tags, start, due, desc, priority)
+            else:
+                create_task(title, tags, start, due, desc, priority)
+
+            fetch_tasks()  # Rafraîchit tout le cache
+            popup.dismiss()
+            self.manager.get_screen('tags').build_ui()
+            self.manager.transition.direction = 'right'
+
+            if self.edit_uid:
+                # Retrouver la tâche mise à jour dans le cache frais
+                task_data_updated = None
+                for tag_tasks in state.PAR_TAG.values():
+                    for t in tag_tasks:
+                        if t.task_uid == self.edit_uid:
+                            task_data_updated = t
+                            break
+                    if task_data_updated:
+                        break
+                if task_data_updated:
+                    self.manager.get_screen('detail').load_task(task_data_updated)
+                self.manager.current = 'detail'
+            elif self.parent_uid:
+                self.manager.current = 'detail'
+            else:
+                self.manager.current = 'tags'
+
+        Clock.schedule_once(do_save, 0.1)
+========== ./screens/tags.py ==========
+from kivy.uix.screenmanager import Screen
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.clock import Clock
+from datetime import date
+import state
+from widgets import loading_popup
+
+
+def is_actionable(task):
+    # Exclure "Un jour"
+    if task.priority == 9 or task.fuzzy == 'someday':
+        return False
+    # Exclure si DTSTART dans le futur
+    if task.start_str:
+        try:
+            start_date = date(
+                int(task.start_str[6:10]),
+                int(task.start_str[3:5]),
+                int(task.start_str[0:2])
+            )
+            if start_date > date.today():
+                return False
+        except Exception:
+            pass
+    return True
+
+
+class TagsScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def build_ui(self):
+        self.clear_widgets()
+        root = BoxLayout(orientation='vertical')
+
+        # ── HEADER ────────────────────────────────────────────────
+        header = BoxLayout(size_hint_y=None, height=55, padding=[5, 5])
+        header.add_widget(Label(
+            text='gtgDroid',
+            bold=True, font_size=22,
+            color=(0.2, 0.5, 0.9, 1)
+        ))
+        btn_refresh = Button(
+            text='Rafraîchir',
+            size_hint_x=0.35,
+            background_color=(0.2, 0.5, 0.9, 1),
+            color=(1, 1, 1, 1),
+            font_size=13
+        )
+        btn_refresh.bind(on_press=self.refresh)
+        btn_new = Button(
+            text='  +  ',
+            size_hint_x=0.15,
+            background_color=(0.2, 0.7, 0.3, 1),
+            color=(1, 1, 1, 1),
+            font_size=20,
+            bold=True
+        )
+        btn_new.bind(on_press=self.go_to_new)
+        header.add_widget(btn_refresh)
+        header.add_widget(btn_new)
+        root.add_widget(header)
+
+        # ── BOUTONS DE VUE ────────────────────────────────────────
+        view_bar = BoxLayout(size_hint_y=None, height=45, spacing=3, padding=[5, 3])
+
+        def make_view_btn(text, view_name):
+            is_active = state.CURRENT_VIEW == view_name
+            btn = Button(
+                text=text,
+                background_color=(0.2, 0.5, 0.9, 1) if is_active else (0.7, 0.7, 0.7, 1),
+                color=(1, 1, 1, 1),
+                font_size=13,
+                bold=is_active
+            )
+            def on_press(x, v=view_name):
+                state.CURRENT_VIEW = v
+                self.build_ui()
+            btn.bind(on_press=on_press)
+            return btn
+
+        view_bar.add_widget(make_view_btn('Ouvertes', 'open'))
+        view_bar.add_widget(make_view_btn('Actionnables', 'actionable'))
+        view_bar.add_widget(make_view_btn('Fermées', 'closed'))
+        view_bar.add_widget(make_view_btn('Abandonnées', 'dismissed'))
+        root.add_widget(view_bar)
+
+        # ── CALCUL DES TAGS SELON LA VUE ──────────────────────────
+        par_tag_view = {}
+        if state.CURRENT_VIEW == 'closed':
+            source = state.PAR_TAG_CLOSED
+        elif state.CURRENT_VIEW == 'dismissed':
+            source = state.PAR_TAG_DISMISSED
+        else:
+            source = state.PAR_TAG
+
+        for tag, taches in source.items():
+            if state.CURRENT_VIEW == 'actionable':
+                filtered = [t for t in taches if is_actionable(t)]
+            else:
+                filtered = taches
+            if filtered:
+                par_tag_view[tag] = filtered
+
+        # ── LISTE DES TAGS ────────────────────────────────────────
+        scroll = ScrollView()
+        layout = GridLayout(cols=1, spacing=3, size_hint_y=None, padding=[10, 5])
+        layout.bind(minimum_height=layout.setter('height'))
+
+        for tag in sorted(par_tag_view.keys()):
+            taches = par_tag_view[tag]
+            nb = len(taches)
+
+            # Compter les tâches avec enfants pour info visuelle
+            nb_avec_enfants = sum(1 for t in taches if t.has_children)
+
+            # Indicateur si le tag contient des tâches parentes
+            indicateur = '  ▶' if nb_avec_enfants > 0 else ''
+
+            btn = Button(
+                text=f"  #{tag}  ({nb}){indicateur}",
+                size_hint_y=None, height=55,
+                halign='left',
+                background_color=(1, 1, 1, 1),
+                color=(0.2, 0.5, 0.9, 1),
+                font_size=16,
+                bold=True
+            )
+            btn.tag = tag
+            btn.tag_tasks = taches
+            btn.bind(on_press=self.go_to_tasks)
+            layout.add_widget(btn)
+
+        if not par_tag_view:
+            layout.add_widget(Label(
+                text='Aucune tâche dans cette vue.',
+                size_hint_y=None, height=55,
+                color=(0.5, 0.5, 0.5, 1),
+                font_size=15
+            ))
+
+        scroll.add_widget(layout)
+        root.add_widget(scroll)
+        self.add_widget(root)
+
+    def refresh(self, *args):
+        popup = loading_popup()
+        def do_refresh(dt):
+            from caldav_api import fetch_all
+            fetch_all()
+            popup.dismiss()
+            self.build_ui()
+        Clock.schedule_once(do_refresh, 0.1)
+
+    def go_to_tasks(self, btn):
+        state.CURRENT_TAG = btn.tag
+        self.manager.transition.direction = 'left'
+        self.manager.get_screen('tasks').load_tag(btn.tag, btn.tag_tasks)
+        self.manager.current = 'tasks'
+
+    def go_to_new(self, btn):
+        self.manager.transition.direction = 'left'
+        self.manager.get_screen('new').load_form()
+        self.manager.current = 'new'
+========== ./screens/tasks.py ==========
+from kivy.uix.screenmanager import Screen
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+import state
+
+
+class TasksScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.root = BoxLayout(orientation='vertical')
+        self.add_widget(self.root)
+
+    def load_tag(self, tag, taches=None):
+        self.root.clear_widgets()
+
+        if taches is None:
+            taches = state.PAR_TAG.get(tag, [])
+        taches = sorted(taches, key=lambda x: x.due_str or 'zzz')
+
+        # ── HEADER ────────────────────────────────────────────────
+        header = BoxLayout(size_hint_y=None, height=55, padding=[5, 5])
+        btn_back = Button(
+            text='< Retour',
+            size_hint_x=0.25,
+            background_color=(0.2, 0.5, 0.9, 1),
+            color=(1, 1, 1, 1),
+            font_size=14
+        )
+        def go_back(x):
+            self.manager.transition.direction = 'right'
+            self.manager.current = 'tags'
+        btn_back.bind(on_press=go_back)
+
+        btn_new = Button(
+            text='  +  ',
+            size_hint_x=0.15,
+            background_color=(0.2, 0.7, 0.3, 1),
+            color=(1, 1, 1, 1),
+            font_size=20,
+            bold=True
+        )
+        def go_new(x):
+            self.manager.transition.direction = 'left'
+            self.manager.get_screen('new').load_form(default_tag=tag)
+            self.manager.current = 'new'
+        btn_new.bind(on_press=go_new)
+
+        header.add_widget(btn_back)
+        header.add_widget(Label(
+            text=f"#{tag}",
+            bold=True, font_size=18,
+            color=(0.2, 0.5, 0.9, 1)
+        ))
+        header.add_widget(btn_new)
+        self.root.add_widget(header)
+
+        # ── LISTE DES TÂCHES ──────────────────────────────────────
+        scroll = ScrollView()
+        layout = GridLayout(cols=1, spacing=2, size_hint_y=None, padding=[10, 5])
+        layout.bind(minimum_height=layout.setter('height'))
+
+        for task_data in taches:
+            title_task = task_data.title
+            status = task_data.status
+            due_str = task_data.due_str
+            task_uid = task_data.task_uid
+            has_children = task_data.has_children
+            priority = task_data.priority
+
+            # Icône statut
+            if status == 'COMPLETED':
+                icone_statut = '✓'
+            elif has_children:
+                icone_statut = '▶'
+            else:
+                icone_statut = '○'
+
+            # Couleur selon présence d'enfants
+            if has_children:
+                bg_color = (0.93, 0.95, 1.0, 1)
+                txt_color = (0.15, 0.35, 0.75, 1)
+            else:
+                bg_color = (1, 1, 1, 1)
+                txt_color = (0.1, 0.1, 0.1, 1)
+
+            # Tags depuis le cache — zéro appel réseau
+            tags_str = task_data.tags
+            tags_autres = [t.strip() for t in tags_str.split(',')
+                          if t.strip() and t.strip() != tag] if tags_str else []
+
+            # Ligne principale : icône + titre + date
+            date_str = f"   {due_str}" if due_str else ''
+            ligne_titre = f"  {icone_statut}  {title_task}{date_str}"
+
+            # Ligne secondaire : autres tags (sauf le tag courant)
+            if tags_autres:
+                ligne_tags = '  ' + '  '.join([f"@{t}" for t in tags_autres])
+                hauteur = 65  # Plus haut pour afficher les deux lignes
+                texte = f"{ligne_titre}\n{ligne_tags}"
+                taille_tags = 12
+            else:
+                texte = ligne_titre
+                hauteur = 50
+                taille_tags = 0
+
+            btn = Button(
+                text=texte,
+                size_hint_y=None, height=hauteur,
+                halign='left',
+                background_color=bg_color,
+                color=txt_color,
+                font_size=15
+            )
+            btn.task_data = task_data
+            btn.bind(on_press=self.go_to_detail)
+            layout.add_widget(btn)
+
+        scroll.add_widget(layout)
+        self.root.add_widget(scroll)
+
+    def go_to_detail(self, btn):
+        self.manager.transition.direction = 'left'
+        self.manager.get_screen('detail').load_task(btn.task_data)
+        self.manager.current = 'detail'
+========== ./state.py ==========
+PAR_TAG = {}           # dict {tag: [tuple_tâche, ...]} — tâches ouvertes (NEEDS-ACTION)
+PAR_TAG_CLOSED = {}    # dict {tag: [tuple_tâche, ...]} — tâches faites (COMPLETED)
+PAR_TAG_DISMISSED = {} # dict {tag: [tuple_tâche, ...]} — tâches abandonnées (CANCELLED)
+CURRENT_TAG = ''       # tag sélectionné en cours
+CURRENT_VIEW = 'open'  # vue active : 'open', 'actionable', 'closed', 'dismissed'
+
+# Cache local — chargé une seule fois au démarrage via fetch_all()
+TAGS_PAR_UID = {}      # {task_uid: "IT, urgent"} — tous les tags d'une tâche
+SUBTASKS_PAR_UID = {}  # {task_uid: [tuple_tâche, ...]} — sous-tâches triées A→Z
+========== ./widgets.py ==========
+from kivy.uix.label import Label
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
+from kivy.uix.popup import Popup
+
+def confirm_popup(message, on_confirm):
+    content = BoxLayout(orientation='vertical', padding=10, spacing=10)
+    content.add_widget(Label(text=message, halign='center'))
+    buttons = BoxLayout(size_hint_y=None, height=45, spacing=10)
+    popup = Popup(
+        title='Confirmation',
+        content=content,
+        size_hint=(0.8, 0.35),
+        auto_dismiss=False
+    )
+    btn_oui = Button(text='Oui', background_color=(0.8, 0.2, 0.2, 1), color=(1, 1, 1, 1))
+    btn_non = Button(text='Non', background_color=(0.4, 0.4, 0.4, 1), color=(1, 1, 1, 1))
+    def do_confirm(x):
+        popup.dismiss()
+        on_confirm()
+    btn_oui.bind(on_press=do_confirm)
+    btn_non.bind(on_press=popup.dismiss)
+    buttons.add_widget(btn_oui)
+    buttons.add_widget(btn_non)
+    content.add_widget(buttons)
+    popup.open()
+
+def loading_popup():
+    content = BoxLayout(orientation='vertical', padding=10)
+    content.add_widget(Label(text='Actualisation en cours...', halign='center'))
+    popup = Popup(
+        title='',
+        content=content,
+        size_hint=(0.6, 0.2),
+        auto_dismiss=False
+    )
+    popup.open()
+    return popup

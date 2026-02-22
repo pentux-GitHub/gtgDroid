@@ -17,11 +17,14 @@ class DetailScreen(Screen):
         self._cancel_event = None
         self._pending_uid = None
         self._from_parent_data = None
+        self._from_screen = 'tasks'  # 'tasks' ou 'action'
 
-    def load_task(self, task_data, from_parent_data=None):
+    def load_task(self, task_data, from_parent_data=None, from_screen=None):
         self.root.clear_widgets()
         self.task_data = task_data
         self._from_parent_data = from_parent_data
+        if from_screen is not None:
+            self._from_screen = from_screen
 
         title_task = task_data.title
         status = task_data.status
@@ -51,7 +54,7 @@ class DetailScreen(Screen):
             if self._from_parent_data is not None:
                 self.load_task(self._from_parent_data)
             else:
-                self.manager.current = 'tasks'
+                self.manager.current = self._from_screen
         btn_back.bind(on_press=go_back)
 
         btn_edit = Button(

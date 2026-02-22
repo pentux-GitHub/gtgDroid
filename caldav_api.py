@@ -243,6 +243,10 @@ def create_task(title, tags=None, start=None, due=None, description='', priority
                 todo.add('due', datetime.strptime(due, '%d/%m/%Y').date())
             if priority:
                 todo.add('priority', priority)
+                if priority == 5:
+                    todo.add('x-gtg-fuzzy', 'soon')
+                elif priority == 9:
+                    todo.add('x-gtg-fuzzy', 'someday')
             cal.add_component(todo)
             calendar.add_todo(cal.to_ical().decode('utf-8'))
             return new_uid
@@ -280,6 +284,10 @@ def create_subtask(parent_uid, title, tags=None, start=None, due=None, descripti
                 todo.add('due', datetime.strptime(due, '%d/%m/%Y').date())
             if priority:
                 todo.add('priority', priority)
+                if priority == 5:
+                    todo.add('x-gtg-fuzzy', 'soon')
+                elif priority == 9:
+                    todo.add('x-gtg-fuzzy', 'someday')
             cal.add_component(todo)
             calendar.add_todo(cal.to_ical().decode('utf-8'))
             return new_uid
@@ -324,8 +332,15 @@ def update_task(task_uid, new_title, new_tags=None, new_start=None, new_due=None
                     del vtodo['DUE']
                 if new_priority:
                     vtodo['PRIORITY'] = new_priority
-                elif 'PRIORITY' in vtodo:
-                    del vtodo['PRIORITY']
+                    if new_priority == 5:
+                        vtodo['X-GTG-FUZZY'] = 'soon'
+                    elif new_priority == 9:
+                        vtodo['X-GTG-FUZZY'] = 'someday'
+                else:
+                    if 'PRIORITY' in vtodo:
+                        del vtodo['PRIORITY']
+                    if 'X-GTG-FUZZY' in vtodo:
+                        del vtodo['X-GTG-FUZZY']
                 todo.save()
                 return True
     return False
@@ -367,7 +382,7 @@ def reset_and_clone_task(task_uid):
     subtasks_data = fetch_subtasks(task_uid)
     parent_todo.complete()
     for subtask in subtasks_data:
-        mark_as_done(subtask[5])
+        mark_as_done(subtask.task_uid)
 
     new_parent_uid = create_task(
         title=parent_title,
@@ -382,9 +397,9 @@ def reset_and_clone_task(task_uid):
     for subtask in subtasks_data:
         create_subtask(
             parent_uid=new_parent_uid,
-            title=subtask[0],
+            title=subtask.title,
             tags=parent_tags,
-            description=subtask[4] if subtask[4] != 'None' else ''
+            description=subtask.description if subtask.description != 'None' else ''
         )
 
     return new_parent_uid
