@@ -11,17 +11,16 @@ from widgets import loading_popup
 
 
 def is_actionable(task):
-    title, status, due_str, start_str, description, task_uid, priority, has_children = task
     # Exclure "Un jour"
-    if priority == 9:
+    if task.priority == 9 or task.fuzzy == 'someday':
         return False
     # Exclure si DTSTART dans le futur
-    if start_str:
+    if task.start_str:
         try:
             start_date = date(
-                int(start_str[6:10]),
-                int(start_str[3:5]),
-                int(start_str[0:2])
+                int(task.start_str[6:10]),
+                int(task.start_str[3:5]),
+                int(task.start_str[0:2])
             )
             if start_date > date.today():
                 return False
@@ -117,7 +116,7 @@ class TagsScreen(Screen):
             nb = len(taches)
 
             # Compter les tâches avec enfants pour info visuelle
-            nb_avec_enfants = sum(1 for t in taches if t[7])
+            nb_avec_enfants = sum(1 for t in taches if t.has_children)
 
             # Indicateur si le tag contient des tâches parentes
             indicateur = '  ▶' if nb_avec_enfants > 0 else ''

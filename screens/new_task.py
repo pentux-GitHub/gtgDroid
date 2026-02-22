@@ -31,7 +31,7 @@ class NewTaskScreen(Screen):
         # Toujours réinitialiser l'état avant de construire le formulaire
         self.edit_uid = None
         self.parent_uid = None
-        self.edit_uid = edit_data[5] if edit_data else None
+        self.edit_uid = edit_data.task_uid if edit_data else None
         self.parent_uid = parent_uid
 
         # Titre du formulaire selon le contexte
@@ -81,7 +81,7 @@ class NewTaskScreen(Screen):
         ))
         self.input_title = TextInput(
             hint_text='Titre de la tâche...',
-            text=edit_data[0] if edit_data else '',
+            text=edit_data.title if edit_data else '',
             size_hint_y=None, height=50,
             multiline=False,
             font_size=15
@@ -102,7 +102,7 @@ class NewTaskScreen(Screen):
             if edit_data:
                 # Récupérer TOUS les tags de la tâche depuis CalDAV
                 from caldav_api import fetch_tags_for_uid
-                current_tag = fetch_tags_for_uid(edit_data[5])
+                current_tag = fetch_tags_for_uid(edit_data.task_uid)
             self.input_tag = TextInput(
                 hint_text='ex: TVX, IT, Home (virgule pour séparer)',
                 text=current_tag or default_tag,
@@ -125,7 +125,7 @@ class NewTaskScreen(Screen):
         ))
         self.input_start = TextInput(
             hint_text='JJ/MM/AAAA',
-            text=edit_data[3] if edit_data else '',
+            text=edit_data.start_str if edit_data else '',
             size_hint_y=None, height=50,
             multiline=False,
             font_size=15
@@ -154,7 +154,7 @@ class NewTaskScreen(Screen):
         ))
         self.input_due = TextInput(
             hint_text='JJ/MM/AAAA',
-            text=edit_data[2] if edit_data else '',
+            text=edit_data.due_str if edit_data else '',
             size_hint_y=None, height=50,
             multiline=False,
             font_size=15
@@ -182,8 +182,9 @@ class NewTaskScreen(Screen):
                 color=(0.3, 0.3, 0.3, 1),
                 bold=True
             ))
-            current_priority = edit_data[6] if edit_data else 0
-            self._priority = current_priority
+        current_priority = edit_data.priority if edit_data else 0
+        self._priority = current_priority
+        if not parent_uid:
             btns_priority = BoxLayout(size_hint_y=None, height=50, spacing=5)
             self.btn_bientot = Button(
                 text='Bientôt',
@@ -237,7 +238,7 @@ class NewTaskScreen(Screen):
             color=(0.3, 0.3, 0.3, 1),
             bold=True
         ))
-        desc = edit_data[4] if edit_data and edit_data[4] != 'None' else ''
+        desc = edit_data.description if edit_data and edit_data.description != 'None' else ''
         self.input_desc = TextInput(
             hint_text='Notes...',
             text=desc,
@@ -295,7 +296,7 @@ class NewTaskScreen(Screen):
                 task_data_updated = None
                 for tag_tasks in state.PAR_TAG.values():
                     for t in tag_tasks:
-                        if t[5] == self.edit_uid:
+                        if t.task_uid == self.edit_uid:
                             task_data_updated = t
                             break
                     if task_data_updated:

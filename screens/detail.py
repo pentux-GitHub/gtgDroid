@@ -23,7 +23,14 @@ class DetailScreen(Screen):
         self.task_data = task_data
         self._from_parent_data = from_parent_data
 
-        title_task, status, due_str, start_str, description, task_uid, priority, has_children = task_data
+        title_task = task_data.title
+        status = task_data.status
+        due_str = task_data.due_str
+        start_str = task_data.start_str
+        description = task_data.description
+        task_uid = task_data.task_uid
+        priority = task_data.priority
+        has_children = task_data.has_children
 
         # ── HEADER ────────────────────────────────────────────────
         header = BoxLayout(size_hint_y=None, height=55, padding=[5, 5])
@@ -312,7 +319,10 @@ class DetailScreen(Screen):
 
     def _add_subtask_row(self, sub_data):
         """Ajoute une ligne de sous-tâche avec case à cocher et bouton détail."""
-        sub_title, sub_status, sub_due, sub_start, sub_desc, sub_uid, sub_priority, sub_has_children = sub_data
+        sub_title = sub_data.title
+        sub_status = sub_data.status
+        sub_uid = sub_data.task_uid
+        sub_has_children = sub_data.has_children
 
         row = BoxLayout(size_hint_y=None, height=50, spacing=5)
 
@@ -371,7 +381,7 @@ class DetailScreen(Screen):
             mark_as_done(sub_uid)
             fetch_tasks()  # Rafraîchit le cache complet
             popup.dismiss()
-            self._load_subtasks(self.task_data[5])
+            self._load_subtasks(self.task_data.task_uid)
         Clock.schedule_once(_execute, 0.1)
 
     def _go_to_subtask_detail(self, btn):

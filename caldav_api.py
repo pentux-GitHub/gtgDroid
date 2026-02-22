@@ -4,6 +4,7 @@ from datetime import datetime
 import uuid
 from collections import defaultdict
 from config import URL, USERNAME, PASSWORD
+from models import Task
 import state
 
 
@@ -76,7 +77,7 @@ def fetch_all():
             parents_set.add(parent_uid)
             subtasks_raw[parent_uid].append(vtodo)
 
-    # Étape 2 : construire les tuples et remplir PAR_TAG, PAR_TAG_CLOSED, TAGS_PAR_UID
+    # Étape 2 : construire les objets Task et remplir PAR_TAG, PAR_TAG_CLOSED, TAGS_PAR_UID
     for vtodo in all_vtodos:
         title = str(vtodo.get('SUMMARY', 'Sans titre'))
         status = str(vtodo.get('STATUS', 'NEEDS-ACTION'))
@@ -87,6 +88,7 @@ def fetch_all():
         description = str(vtodo.get('DESCRIPTION', ''))
         task_uid = str(vtodo.get('UID', ''))
         priority = int(vtodo.get('PRIORITY', 0))
+        fuzzy = str(vtodo.get('X-GTG-FUZZY', ''))
         categories = vtodo.get('CATEGORIES', None)
         tags = [str(c) for c in categories.cats] if categories else []
         tags_clean = _clean_tags(tags)
@@ -96,17 +98,28 @@ def fetch_all():
         tags_str = ', '.join(t for t in tags_clean if t != 'Sans tag')
         tags_par_uid[task_uid] = tags_str
 
-        tuple_tache = (title, status, due_str, start_str, description, task_uid, priority, has_children)
+        task = Task(
+            title=title,
+            status=status,
+            due_str=due_str,
+            start_str=start_str,
+            description=description,
+            task_uid=task_uid,
+            priority=priority,
+            has_children=has_children,
+            fuzzy=fuzzy,
+            tags=tags_str
+        )
 
         if status == 'COMPLETED':
             for tag in tags_clean:
-                par_tag_closed[tag].append(tuple_tache)
+                par_tag_closed[tag].append(task)
         elif status == 'CANCELLED':
             for tag in tags_clean:
-                par_tag_dismissed[tag].append(tuple_tache)
+                par_tag_dismissed[tag].append(task)
         else:
             for tag in tags_clean:
-                par_tag[tag].append(tuple_tache)
+                par_tag[tag].append(task)
 
     # Étape 3 : construire le cache des sous-tâches triées A→Z
     subtasks_par_uid = {}
@@ -122,9 +135,15 @@ def fetch_all():
             description = str(vtodo.get('DESCRIPTION', ''))
             task_uid = str(vtodo.get('UID', ''))
             priority = int(vtodo.get('PRIORITY', 0))
+            fuzzy = str(vtodo.get('X-GTG-FUZZY', ''))
             has_children = task_uid in parents_set
-            subtasks.append((title, status, due_str, start_str, description, task_uid, priority, has_children))
-        subtasks.sort(key=lambda x: x[0])
+            subtasks.append(Task(
+                title=title, status=status, due_str=due_str,
+                start_str=start_str, description=description,
+                task_uid=task_uid, priority=priority,
+                has_children=has_children, fuzzy=fuzzy
+            ))
+        subtasks.sort(key=lambda t: t.title)
         subtasks_par_uid[parent_uid] = subtasks
 
     # Mise à jour atomique du state

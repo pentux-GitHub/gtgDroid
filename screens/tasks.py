@@ -18,7 +18,7 @@ class TasksScreen(Screen):
 
         if taches is None:
             taches = state.PAR_TAG.get(tag, [])
-        taches = sorted(taches, key=lambda x: x[2] or 'zzz')
+        taches = sorted(taches, key=lambda x: x.due_str or 'zzz')
 
         # ── HEADER ────────────────────────────────────────────────
         header = BoxLayout(size_hint_y=None, height=55, padding=[5, 5])
@@ -63,7 +63,12 @@ class TasksScreen(Screen):
         layout.bind(minimum_height=layout.setter('height'))
 
         for task_data in taches:
-            title_task, status, due_str, start_str, description, task_uid, priority, has_children = task_data
+            title_task = task_data.title
+            status = task_data.status
+            due_str = task_data.due_str
+            task_uid = task_data.task_uid
+            has_children = task_data.has_children
+            priority = task_data.priority
 
             # Icône statut
             if status == 'COMPLETED':
@@ -82,7 +87,7 @@ class TasksScreen(Screen):
                 txt_color = (0.1, 0.1, 0.1, 1)
 
             # Tags depuis le cache — zéro appel réseau
-            tags_str = state.TAGS_PAR_UID.get(task_uid, '')
+            tags_str = task_data.tags
             tags_autres = [t.strip() for t in tags_str.split(',')
                           if t.strip() and t.strip() != tag] if tags_str else []
 
