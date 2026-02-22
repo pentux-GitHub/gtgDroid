@@ -20,10 +20,11 @@ class TasksScreen(Screen):
             taches = state.PAR_TAG.get(tag, [])
         taches = sorted(taches, key=lambda x: x[2] or 'zzz')
 
+        # ── HEADER ────────────────────────────────────────────────
         header = BoxLayout(size_hint_y=None, height=55, padding=[5, 5])
         btn_back = Button(
             text='< Retour',
-            size_hint_x=0.3,
+            size_hint_x=0.25,
             background_color=(0.2, 0.5, 0.9, 1),
             color=(1, 1, 1, 1),
             font_size=14
@@ -32,30 +33,83 @@ class TasksScreen(Screen):
             self.manager.transition.direction = 'right'
             self.manager.current = 'tags'
         btn_back.bind(on_press=go_back)
+
+        btn_new = Button(
+            text='  +  ',
+            size_hint_x=0.15,
+            background_color=(0.2, 0.7, 0.3, 1),
+            color=(1, 1, 1, 1),
+            font_size=20,
+            bold=True
+        )
+        def go_new(x):
+            self.manager.transition.direction = 'left'
+            self.manager.get_screen('new').load_form(default_tag=tag)
+            self.manager.current = 'new'
+        btn_new.bind(on_press=go_new)
+
         header.add_widget(btn_back)
         header.add_widget(Label(
             text=f"#{tag}",
             bold=True, font_size=18,
             color=(0.2, 0.5, 0.9, 1)
         ))
+        header.add_widget(btn_new)
         self.root.add_widget(header)
 
+        # ── LISTE DES TÂCHES ──────────────────────────────────────
         scroll = ScrollView()
         layout = GridLayout(cols=1, spacing=2, size_hint_y=None, padding=[10, 5])
         layout.bind(minimum_height=layout.setter('height'))
 
-        for title_task, status, due_str, start_str, description, task_uid, priority in taches:
-            icone = 'OK' if status == 'COMPLETED' else 'o'
+        for task_data in taches:
+            title_task, status, due_str, start_str, description, task_uid, priority, has_children = task_data
+
+            # Icône statut
+            if status == 'COMPLETED':
+                icone_statut = '✓'
+            elif has_children:
+                icone_statut = '▶'
+            else:
+                icone_statut = '○'
+
+            # Couleur selon présence d'enfants
+            if has_children:
+                bg_color = (0.93, 0.95, 1.0, 1)
+                txt_color = (0.15, 0.35, 0.75, 1)
+            else:
+                bg_color = (1, 1, 1, 1)
+                txt_color = (0.1, 0.1, 0.1, 1)
+
+            # Tags depuis le cache — zéro appel réseau
+            tags_str = state.TAGS_PAR_UID.get(task_uid, '')
+            tags_autres = [t.strip() for t in tags_str.split(',')
+                          if t.strip() and t.strip() != tag] if tags_str else []
+
+            # Ligne principale : icône + titre + date
             date_str = f"   {due_str}" if due_str else ''
+            ligne_titre = f"  {icone_statut}  {title_task}{date_str}"
+
+            # Ligne secondaire : autres tags (sauf le tag courant)
+            if tags_autres:
+                ligne_tags = '  ' + '  '.join([f"@{t}" for t in tags_autres])
+                hauteur = 65  # Plus haut pour afficher les deux lignes
+                texte = f"{ligne_titre}\n{ligne_tags}"
+                taille_tags = 12
+            else:
+                texte = ligne_titre
+                hauteur = 50
+                taille_tags = 0
+
             btn = Button(
-                text=f"  {icone}  {title_task}{date_str}",
-                size_hint_y=None, height=50,
+                text=texte,
+                size_hint_y=None, height=hauteur,
                 halign='left',
-                background_color=(1, 1, 1, 1),
-                color=(0.1, 0.1, 0.1, 1),
+                background_color=bg_color,
+                color=txt_color,
                 font_size=15
             )
-            btn.task_data = (title_task, status, due_str, start_str, description, task_uid, priority)
+            btn.task_data = task_data
             btn.bind(on_press=self.go_to_detail)
             layout.add_widget(btn)
 
